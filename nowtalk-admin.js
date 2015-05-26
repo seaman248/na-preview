@@ -1015,7 +1015,7 @@
 	                    ), 
 	                    React.createElement("div", {className: "nowtalk-admin__privacySettingInput"}, 
 	                      React.createElement("form", null, 
-	                        React.createElement("input", {type: "text", placeholder: "Add custom words to a list of banned words"})
+	                        React.createElement("input", {type: "text", placeholder: "Add to custom list of banned words"})
 	                      ), 
 	                      React.createElement("ul", {className: "nowtalk-admin__bad-words"}, 
 	                        React.createElement("li", null, 
