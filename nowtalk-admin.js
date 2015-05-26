@@ -49,7 +49,7 @@
 /***/ function(module, exports, __webpack_require__) {
 
 	__webpack_require__(2);
-	module.exports = __webpack_require__(95);
+	module.exports = __webpack_require__(96);
 
 
 /***/ },
@@ -57,28 +57,498 @@
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
-	 * Copyright 2013-2015, Facebook, Inc.
+	 * Copyright 2013-2015 Facebook, Inc.
 	 * All rights reserved.
 	 *
 	 * This source code is licensed under the BSD-style license found in the
 	 * LICENSE file in the root directory of this source tree. An additional grant
 	 * of patent rights can be found in the PATENTS file in the same directory.
 	 *
-	 * @providesModule ClientReactRootIndex
-	 * @typechecks
+	 * @providesModule BeforeInputEventPlugin
+	 * @typechecks static-only
 	 */
 
 	'use strict';
 
-	var nextReactRootIndex = 0;
+	var EventConstants = __webpack_require__(72);
+	var EventPropagators = __webpack_require__(74);
+	var ExecutionEnvironment = __webpack_require__(60);
+	var FallbackCompositionState = __webpack_require__(147);
+	var SyntheticCompositionEvent = __webpack_require__(148);
+	var SyntheticInputEvent = __webpack_require__(149);
 
-	var ClientReactRootIndex = {
-	  createReactRootIndex: function() {
-	    return nextReactRootIndex++;
+	var keyOf = __webpack_require__(68);
+
+	var END_KEYCODES = [9, 13, 27, 32]; // Tab, Return, Esc, Space
+	var START_KEYCODE = 229;
+
+	var canUseCompositionEvent = (
+	  ExecutionEnvironment.canUseDOM &&
+	  'CompositionEvent' in window
+	);
+
+	var documentMode = null;
+	if (ExecutionEnvironment.canUseDOM && 'documentMode' in document) {
+	  documentMode = document.documentMode;
+	}
+
+	// Webkit offers a very useful `textInput` event that can be used to
+	// directly represent `beforeInput`. The IE `textinput` event is not as
+	// useful, so we don't use it.
+	var canUseTextInputEvent = (
+	  ExecutionEnvironment.canUseDOM &&
+	  'TextEvent' in window &&
+	  !documentMode &&
+	  !isPresto()
+	);
+
+	// In IE9+, we have access to composition events, but the data supplied
+	// by the native compositionend event may be incorrect. Japanese ideographic
+	// spaces, for instance (\u3000) are not recorded correctly.
+	var useFallbackCompositionData = (
+	  ExecutionEnvironment.canUseDOM &&
+	  (
+	    (!canUseCompositionEvent || documentMode && documentMode > 8 && documentMode <= 11)
+	  )
+	);
+
+	/**
+	 * Opera <= 12 includes TextEvent in window, but does not fire
+	 * text input events. Rely on keypress instead.
+	 */
+	function isPresto() {
+	  var opera = window.opera;
+	  return (
+	    typeof opera === 'object' &&
+	    typeof opera.version === 'function' &&
+	    parseInt(opera.version(), 10) <= 12
+	  );
+	}
+
+	var SPACEBAR_CODE = 32;
+	var SPACEBAR_CHAR = String.fromCharCode(SPACEBAR_CODE);
+
+	var topLevelTypes = EventConstants.topLevelTypes;
+
+	// Events and their corresponding property names.
+	var eventTypes = {
+	  beforeInput: {
+	    phasedRegistrationNames: {
+	      bubbled: keyOf({onBeforeInput: null}),
+	      captured: keyOf({onBeforeInputCapture: null})
+	    },
+	    dependencies: [
+	      topLevelTypes.topCompositionEnd,
+	      topLevelTypes.topKeyPress,
+	      topLevelTypes.topTextInput,
+	      topLevelTypes.topPaste
+	    ]
+	  },
+	  compositionEnd: {
+	    phasedRegistrationNames: {
+	      bubbled: keyOf({onCompositionEnd: null}),
+	      captured: keyOf({onCompositionEndCapture: null})
+	    },
+	    dependencies: [
+	      topLevelTypes.topBlur,
+	      topLevelTypes.topCompositionEnd,
+	      topLevelTypes.topKeyDown,
+	      topLevelTypes.topKeyPress,
+	      topLevelTypes.topKeyUp,
+	      topLevelTypes.topMouseDown
+	    ]
+	  },
+	  compositionStart: {
+	    phasedRegistrationNames: {
+	      bubbled: keyOf({onCompositionStart: null}),
+	      captured: keyOf({onCompositionStartCapture: null})
+	    },
+	    dependencies: [
+	      topLevelTypes.topBlur,
+	      topLevelTypes.topCompositionStart,
+	      topLevelTypes.topKeyDown,
+	      topLevelTypes.topKeyPress,
+	      topLevelTypes.topKeyUp,
+	      topLevelTypes.topMouseDown
+	    ]
+	  },
+	  compositionUpdate: {
+	    phasedRegistrationNames: {
+	      bubbled: keyOf({onCompositionUpdate: null}),
+	      captured: keyOf({onCompositionUpdateCapture: null})
+	    },
+	    dependencies: [
+	      topLevelTypes.topBlur,
+	      topLevelTypes.topCompositionUpdate,
+	      topLevelTypes.topKeyDown,
+	      topLevelTypes.topKeyPress,
+	      topLevelTypes.topKeyUp,
+	      topLevelTypes.topMouseDown
+	    ]
 	  }
 	};
 
-	module.exports = ClientReactRootIndex;
+	// Track whether we've ever handled a keypress on the space key.
+	var hasSpaceKeypress = false;
+
+	/**
+	 * Return whether a native keypress event is assumed to be a command.
+	 * This is required because Firefox fires `keypress` events for key commands
+	 * (cut, copy, select-all, etc.) even though no character is inserted.
+	 */
+	function isKeypressCommand(nativeEvent) {
+	  return (
+	    (nativeEvent.ctrlKey || nativeEvent.altKey || nativeEvent.metaKey) &&
+	    // ctrlKey && altKey is equivalent to AltGr, and is not a command.
+	    !(nativeEvent.ctrlKey && nativeEvent.altKey)
+	  );
+	}
+
+
+	/**
+	 * Translate native top level events into event types.
+	 *
+	 * @param {string} topLevelType
+	 * @return {object}
+	 */
+	function getCompositionEventType(topLevelType) {
+	  switch (topLevelType) {
+	    case topLevelTypes.topCompositionStart:
+	      return eventTypes.compositionStart;
+	    case topLevelTypes.topCompositionEnd:
+	      return eventTypes.compositionEnd;
+	    case topLevelTypes.topCompositionUpdate:
+	      return eventTypes.compositionUpdate;
+	  }
+	}
+
+	/**
+	 * Does our fallback best-guess model think this event signifies that
+	 * composition has begun?
+	 *
+	 * @param {string} topLevelType
+	 * @param {object} nativeEvent
+	 * @return {boolean}
+	 */
+	function isFallbackCompositionStart(topLevelType, nativeEvent) {
+	  return (
+	    topLevelType === topLevelTypes.topKeyDown &&
+	    nativeEvent.keyCode === START_KEYCODE
+	  );
+	}
+
+	/**
+	 * Does our fallback mode think that this event is the end of composition?
+	 *
+	 * @param {string} topLevelType
+	 * @param {object} nativeEvent
+	 * @return {boolean}
+	 */
+	function isFallbackCompositionEnd(topLevelType, nativeEvent) {
+	  switch (topLevelType) {
+	    case topLevelTypes.topKeyUp:
+	      // Command keys insert or clear IME input.
+	      return (END_KEYCODES.indexOf(nativeEvent.keyCode) !== -1);
+	    case topLevelTypes.topKeyDown:
+	      // Expect IME keyCode on each keydown. If we get any other
+	      // code we must have exited earlier.
+	      return (nativeEvent.keyCode !== START_KEYCODE);
+	    case topLevelTypes.topKeyPress:
+	    case topLevelTypes.topMouseDown:
+	    case topLevelTypes.topBlur:
+	      // Events are not possible without cancelling IME.
+	      return true;
+	    default:
+	      return false;
+	  }
+	}
+
+	/**
+	 * Google Input Tools provides composition data via a CustomEvent,
+	 * with the `data` property populated in the `detail` object. If this
+	 * is available on the event object, use it. If not, this is a plain
+	 * composition event and we have nothing special to extract.
+	 *
+	 * @param {object} nativeEvent
+	 * @return {?string}
+	 */
+	function getDataFromCustomEvent(nativeEvent) {
+	  var detail = nativeEvent.detail;
+	  if (typeof detail === 'object' && 'data' in detail) {
+	    return detail.data;
+	  }
+	  return null;
+	}
+
+	// Track the current IME composition fallback object, if any.
+	var currentComposition = null;
+
+	/**
+	 * @param {string} topLevelType Record from `EventConstants`.
+	 * @param {DOMEventTarget} topLevelTarget The listening component root node.
+	 * @param {string} topLevelTargetID ID of `topLevelTarget`.
+	 * @param {object} nativeEvent Native browser event.
+	 * @return {?object} A SyntheticCompositionEvent.
+	 */
+	function extractCompositionEvent(
+	  topLevelType,
+	  topLevelTarget,
+	  topLevelTargetID,
+	  nativeEvent
+	) {
+	  var eventType;
+	  var fallbackData;
+
+	  if (canUseCompositionEvent) {
+	    eventType = getCompositionEventType(topLevelType);
+	  } else if (!currentComposition) {
+	    if (isFallbackCompositionStart(topLevelType, nativeEvent)) {
+	      eventType = eventTypes.compositionStart;
+	    }
+	  } else if (isFallbackCompositionEnd(topLevelType, nativeEvent)) {
+	    eventType = eventTypes.compositionEnd;
+	  }
+
+	  if (!eventType) {
+	    return null;
+	  }
+
+	  if (useFallbackCompositionData) {
+	    // The current composition is stored statically and must not be
+	    // overwritten while composition continues.
+	    if (!currentComposition && eventType === eventTypes.compositionStart) {
+	      currentComposition = FallbackCompositionState.getPooled(topLevelTarget);
+	    } else if (eventType === eventTypes.compositionEnd) {
+	      if (currentComposition) {
+	        fallbackData = currentComposition.getData();
+	      }
+	    }
+	  }
+
+	  var event = SyntheticCompositionEvent.getPooled(
+	    eventType,
+	    topLevelTargetID,
+	    nativeEvent
+	  );
+
+	  if (fallbackData) {
+	    // Inject data generated from fallback path into the synthetic event.
+	    // This matches the property of native CompositionEventInterface.
+	    event.data = fallbackData;
+	  } else {
+	    var customData = getDataFromCustomEvent(nativeEvent);
+	    if (customData !== null) {
+	      event.data = customData;
+	    }
+	  }
+
+	  EventPropagators.accumulateTwoPhaseDispatches(event);
+	  return event;
+	}
+
+	/**
+	 * @param {string} topLevelType Record from `EventConstants`.
+	 * @param {object} nativeEvent Native browser event.
+	 * @return {?string} The string corresponding to this `beforeInput` event.
+	 */
+	function getNativeBeforeInputChars(topLevelType, nativeEvent) {
+	  switch (topLevelType) {
+	    case topLevelTypes.topCompositionEnd:
+	      return getDataFromCustomEvent(nativeEvent);
+	    case topLevelTypes.topKeyPress:
+	      /**
+	       * If native `textInput` events are available, our goal is to make
+	       * use of them. However, there is a special case: the spacebar key.
+	       * In Webkit, preventing default on a spacebar `textInput` event
+	       * cancels character insertion, but it *also* causes the browser
+	       * to fall back to its default spacebar behavior of scrolling the
+	       * page.
+	       *
+	       * Tracking at:
+	       * https://code.google.com/p/chromium/issues/detail?id=355103
+	       *
+	       * To avoid this issue, use the keypress event as if no `textInput`
+	       * event is available.
+	       */
+	      var which = nativeEvent.which;
+	      if (which !== SPACEBAR_CODE) {
+	        return null;
+	      }
+
+	      hasSpaceKeypress = true;
+	      return SPACEBAR_CHAR;
+
+	    case topLevelTypes.topTextInput:
+	      // Record the characters to be added to the DOM.
+	      var chars = nativeEvent.data;
+
+	      // If it's a spacebar character, assume that we have already handled
+	      // it at the keypress level and bail immediately. Android Chrome
+	      // doesn't give us keycodes, so we need to blacklist it.
+	      if (chars === SPACEBAR_CHAR && hasSpaceKeypress) {
+	        return null;
+	      }
+
+	      return chars;
+
+	    default:
+	      // For other native event types, do nothing.
+	      return null;
+	  }
+	}
+
+	/**
+	 * For browsers that do not provide the `textInput` event, extract the
+	 * appropriate string to use for SyntheticInputEvent.
+	 *
+	 * @param {string} topLevelType Record from `EventConstants`.
+	 * @param {object} nativeEvent Native browser event.
+	 * @return {?string} The fallback string for this `beforeInput` event.
+	 */
+	function getFallbackBeforeInputChars(topLevelType, nativeEvent) {
+	  // If we are currently composing (IME) and using a fallback to do so,
+	  // try to extract the composed characters from the fallback object.
+	  if (currentComposition) {
+	    if (
+	      topLevelType === topLevelTypes.topCompositionEnd ||
+	      isFallbackCompositionEnd(topLevelType, nativeEvent)
+	    ) {
+	      var chars = currentComposition.getData();
+	      FallbackCompositionState.release(currentComposition);
+	      currentComposition = null;
+	      return chars;
+	    }
+	    return null;
+	  }
+
+	  switch (topLevelType) {
+	    case topLevelTypes.topPaste:
+	      // If a paste event occurs after a keypress, throw out the input
+	      // chars. Paste events should not lead to BeforeInput events.
+	      return null;
+	    case topLevelTypes.topKeyPress:
+	      /**
+	       * As of v27, Firefox may fire keypress events even when no character
+	       * will be inserted. A few possibilities:
+	       *
+	       * - `which` is `0`. Arrow keys, Esc key, etc.
+	       *
+	       * - `which` is the pressed key code, but no char is available.
+	       *   Ex: 'AltGr + d` in Polish. There is no modified character for
+	       *   this key combination and no character is inserted into the
+	       *   document, but FF fires the keypress for char code `100` anyway.
+	       *   No `input` event will occur.
+	       *
+	       * - `which` is the pressed key code, but a command combination is
+	       *   being used. Ex: `Cmd+C`. No character is inserted, and no
+	       *   `input` event will occur.
+	       */
+	      if (nativeEvent.which && !isKeypressCommand(nativeEvent)) {
+	        return String.fromCharCode(nativeEvent.which);
+	      }
+	      return null;
+	    case topLevelTypes.topCompositionEnd:
+	      return useFallbackCompositionData ? null : nativeEvent.data;
+	    default:
+	      return null;
+	  }
+	}
+
+	/**
+	 * Extract a SyntheticInputEvent for `beforeInput`, based on either native
+	 * `textInput` or fallback behavior.
+	 *
+	 * @param {string} topLevelType Record from `EventConstants`.
+	 * @param {DOMEventTarget} topLevelTarget The listening component root node.
+	 * @param {string} topLevelTargetID ID of `topLevelTarget`.
+	 * @param {object} nativeEvent Native browser event.
+	 * @return {?object} A SyntheticInputEvent.
+	 */
+	function extractBeforeInputEvent(
+	  topLevelType,
+	  topLevelTarget,
+	  topLevelTargetID,
+	  nativeEvent
+	) {
+	  var chars;
+
+	  if (canUseTextInputEvent) {
+	    chars = getNativeBeforeInputChars(topLevelType, nativeEvent);
+	  } else {
+	    chars = getFallbackBeforeInputChars(topLevelType, nativeEvent);
+	  }
+
+	  // If no characters are being inserted, no BeforeInput event should
+	  // be fired.
+	  if (!chars) {
+	    return null;
+	  }
+
+	  var event = SyntheticInputEvent.getPooled(
+	    eventTypes.beforeInput,
+	    topLevelTargetID,
+	    nativeEvent
+	  );
+
+	  event.data = chars;
+	  EventPropagators.accumulateTwoPhaseDispatches(event);
+	  return event;
+	}
+
+	/**
+	 * Create an `onBeforeInput` event to match
+	 * http://www.w3.org/TR/2013/WD-DOM-Level-3-Events-20131105/#events-inputevents.
+	 *
+	 * This event plugin is based on the native `textInput` event
+	 * available in Chrome, Safari, Opera, and IE. This event fires after
+	 * `onKeyPress` and `onCompositionEnd`, but before `onInput`.
+	 *
+	 * `beforeInput` is spec'd but not implemented in any browsers, and
+	 * the `input` event does not provide any useful information about what has
+	 * actually been added, contrary to the spec. Thus, `textInput` is the best
+	 * available event to identify the characters that have actually been inserted
+	 * into the target node.
+	 *
+	 * This plugin is also responsible for emitting `composition` events, thus
+	 * allowing us to share composition fallback code for both `beforeInput` and
+	 * `composition` event types.
+	 */
+	var BeforeInputEventPlugin = {
+
+	  eventTypes: eventTypes,
+
+	  /**
+	   * @param {string} topLevelType Record from `EventConstants`.
+	   * @param {DOMEventTarget} topLevelTarget The listening component root node.
+	   * @param {string} topLevelTargetID ID of `topLevelTarget`.
+	   * @param {object} nativeEvent Native browser event.
+	   * @return {*} An accumulation of synthetic events.
+	   * @see {EventPluginHub.extractEvents}
+	   */
+	  extractEvents: function(
+	    topLevelType,
+	    topLevelTarget,
+	    topLevelTargetID,
+	    nativeEvent
+	  ) {
+	    return [
+	      extractCompositionEvent(
+	        topLevelType,
+	        topLevelTarget,
+	        topLevelTargetID,
+	        nativeEvent
+	      ),
+	      extractBeforeInputEvent(
+	        topLevelType,
+	        topLevelTarget,
+	        topLevelTargetID,
+	        nativeEvent
+	      )
+	    ];
+	  }
+	};
+
+	module.exports = BeforeInputEventPlugin;
 
 
 /***/ },
@@ -109,7 +579,7 @@
 /***/ function(module, exports, __webpack_require__) {
 
 	exports = module.exports = __webpack_require__(8)();
-	exports.push([module.id, "@font-face { }\n\n* {\n  margin: 0;\n  padding: 0; }\n\nbody, html {\n  width: 100%;\n  height: 100%;\n  font-size: 13px;\n  overflow: hidden; }\n\n.nowtalk-admin__wrapper {\n  width: 100%;\n  height: 100%; }\n\n.nowtalk-admin__page {\n  width: 100%;\n  height: 100%;\n  font-family: sans-serif; }\n  .nowtalk-admin__page .nowtalk-admin__main {\n    margin-left: 290px;\n    height: 100%; }\n    .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content {\n      float: left;\n      width: 100%;\n      min-width: 450px;\n      background: #F7F7F7;\n      height: 100%;\n      margin: 75px -300px 0 0;\n      overflow: auto; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentarea {\n        background: white;\n        width: 95%;\n        margin-left: auto;\n        margin-right: auto;\n        padding: 30px;\n        box-sizing: border-box;\n        border-left: 1px solid #F4F4F4;\n        border-bottom: 1px solid #F4F4F4;\n        border-right: 1px solid #F4F4F4;\n        color: #717171;\n        font-size: 15px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentarea a {\n          color: #F26C3B;\n          text-decoration: none; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentarea h5 {\n          font-size: 1em;\n          font-weight: 300; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentarea p {\n          font-size: 1.1em; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentarea p.big-helper {\n          font-size: .9em;\n          color: #6F6F6F; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons {\n        list-style-type: none;\n        margin: 20px 0;\n        padding-bottom: 20px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons a {\n          color: #A3A3A3; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li:first-child {\n          margin: 0 5px 0 0; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li {\n          display: inline-block;\n          width: 120px;\n          border: 1px solid #EBEBEB;\n          margin: 0 5px;\n          border-radius: 5px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li.active {\n          background-color: #F26C3B;\n          border: none; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li.active .fa, .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li.active .fi-social-blogger, .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li.active span {\n            color: white; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li.active:after {\n          position: absolute;\n          display: block;\n          content: '';\n          width: 0;\n          height: 0;\n          border-style: solid;\n          margin-left: 50px;\n          border-width: 12px 12.5px 0 12.5px;\n          border-color: #F26C3B transparent transparent transparent; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons .nowtalk-admin__embedNowtalkLink {\n          display: block;\n          width: 100%;\n          height: 120px;\n          text-align: center; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons .nowtalk-admin__embedNowtalkLink i {\n            width: 100%;\n            font-size: 50px;\n            line-height: 85px; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons .nowtalk-admin__embedNowtalkLink .fi-social-blogger {\n            font-size: 65px; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons .nowtalk-admin__embedNowtalkLink span {\n            width: 100%;\n            font-size: .9em;\n            display: inline-block; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .install-link {\n        padding-bottom: 1em; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__embedCodeTextarea {\n        display: block;\n        resize: none;\n        width: 60%;\n        height: 200px;\n        margin: 10px 0;\n        border-radius: 3px;\n        border: 1px solid #D5D5D5;\n        background-color: #F7F7F7;\n        outline: none;\n        padding: 10px;\n        box-sizing: border-box;\n        color: #A3A3A3; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings button {\n        border: none;\n        font-size: 1em;\n        cursor: pointer;\n        outline: none;\n        padding: 8px 20px;\n        border-radius: 5px;\n        margin-right: 10px; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__discardPrivacySettingsButton {\n        background-color: #EDEDED;\n        color: #464A4D; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__discardPrivacySettingsButton:hover {\n        background-color: #F8F8F8; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__savePrivacySettingsButton {\n        background-color: #F16C39;\n        color: white; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__bad-words {\n        font-size: .8em;\n        line-height: 1em; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__bad-words li {\n          display: inline-block;\n          padding: 0 5px;\n          margin: 3px 3px;\n          background-color: white;\n          border: 1px solid #EDEDED;\n          line-height: 1.8em;\n          border-radius: 2px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__bad-words i {\n          padding-left: 5px;\n          cursor: pointer; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList {\n        border-bottom: 1px solid #ECECEC;\n        padding-bottom: 20px;\n        margin-bottom: 40px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList ul {\n          list-style-type: none; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList li {\n          margin: 5px 0;\n          max-width: 350px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting {\n          display: inline-block;\n          width: 350px; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .name {\n            font-size: 1em;\n            display: inline-block;\n            float: left;\n            width: 250px;\n            font-size: 1.05em;\n            line-height: 44px; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__privacySettingInput {\n            display: inline-block;\n            float: left;\n            width: 307px;\n            line-height: 40px; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__privacySettingInput input {\n              width: 100%;\n              border: 1px solid #DBDBDB;\n              padding: 5px;\n              border-radius: 5px;\n              outline: none;\n              background-color: #F7F7F7; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__help {\n            display: inline-block;\n            float: right;\n            line-height: 40px; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__help i {\n              border: 2px solid #BDBDBD;\n              color: #BDBDBD;\n              width: 14px;\n              line-height: 14px;\n              text-align: center;\n              border-radius: 50%;\n              font-size: 12px;\n              cursor: pointer; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__helper {\n            display: none;\n            position: absolute;\n            width: 300px;\n            line-height: 1em;\n            border: 1px solid #DADADA;\n            border-radius: 3px;\n            padding: .6em;\n            font-size: .9em;\n            background-color: white;\n            z-index: 10000000;\n            margin-left: 13px;\n            margin-top: -2px;\n            box-shadow: 1px 1px 5px 0px rgba(50, 50, 50, 0.25); }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__helper.active {\n            display: inline-block;\n            background-color: white; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__helper:after {\n            display: inline-block;\n            top: 13px;\n            right: 100%;\n            position: absolute;\n            content: '';\n            border-style: solid;\n            border-width: 8px 12px 8px 0;\n            border-color: transparent #DCDCDC transparent transparent; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__switcher {\n            float: left;\n            padding: 10px; }\n    .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__switcher {\n      display: inline-block; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__switcher .text-indicator {\n        float: left;\n        line-height: 22px;\n        font-size: .9em;\n        padding-right: 7px; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__switcher .switcherContainer {\n        display: inline-block;\n        background-color: #F7F7F7;\n        border: 1px solid #D1D1D1;\n        border-radius: 3px;\n        padding: 3px;\n        height: 22px;\n        box-sizing: border-box;\n        cursor: pointer;\n        float: right;\n        width: 35px; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__switcher .switch {\n        height: 100%;\n        width: 14px;\n        border-radius: 2px;\n        background-color: #D4D4D4;\n        float: left; }\n    .nowtalk-admin__page .nowtalk-admin__main .switch-on .switch {\n      float: right;\n      background-color: #79D03A; }\n    .nowtalk-admin__page .nowtalk-admin__main .switch-off .switch {\n      float: left;\n      background-color: #C04444; }\n    .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__formarea {\n      float: right;\n      background: #efefef;\n      height: 100%;\n      margin: 75px 0 0 0;\n      -webkit-animation: slide 0.5s forwards;\n      -webkit-animation-delay: 2s;\n      -webkit-animation: slide 0.5s forwards;\n              animation: slide 0.5s forwards;\n      -webkit-animation-delay: 2s;\n              animation-delay: 2s;\n      transition: all 1s ease-in-out; }\n    .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__formarea-init {\n      width: 0px; }\n    .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__formarea-final {\n      width: 300px; }\n  .nowtalk-admin__page .nowtalk-admin__channelarea {\n    position: fixed;\n    float: left;\n    left: 0;\n    top: 0;\n    width: 290px;\n    height: 100%;\n    background: #364147;\n    color: white; }\n    .nowtalk-admin__page .nowtalk-admin__channelarea .nowtalk-admin__channelheader {\n      height: 75px;\n      width: 100%; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea .nowtalk-admin__channelheader img {\n        display: block;\n        margin: 0 auto;\n        height: 37px;\n        padding-top: 19px; }\n    .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist {\n      margin: 0;\n      padding: 0;\n      padding-left: 8px; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist ul {\n        margin-left: 30px;\n        list-style-type: none; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist li {\n        border-bottom: 1px solid #333D42;\n        border-top: 1px solid #374146; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .subsub li {\n        border: none; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .subsub span {\n        color: #66737B; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-submenu .submenu-item-container {\n        padding: 12px 0;\n        font-weight: bold; }\n        .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-submenu .submenu-item-container i {\n          color: #66737B;\n          width: 25px; }\n        .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-submenu .submenu-item-container i.fa-plus, .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-submenu .submenu-item-container i.fa-minus {\n          float: right;\n          padding-right: 13px;\n          font-size: .8em;\n          width: 10px; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist li.nowtalk-admin__channellist-item {\n        cursor: pointer; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-container {\n        padding: 12px 12px 12px 7px; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-icon, .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-photo {\n        display: inline-block;\n        float: left;\n        width: 35px;\n        overflow: hidden; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-icon:after, .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-photo:after {\n        content: '';\n        display: block;\n        clear: both; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-icon {\n        font-size: 20px;\n        color: #5D6A72;\n        line-height: 35px; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-photo {\n        padding: 0 8px 0 0; }\n        .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-photo img {\n          max-width: 100%; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-name {\n        display: inline-block;\n        font-weight: bold;\n        line-height: 35px;\n        font-size: .9em;\n        max-width: 105px;\n        white-space: nowrap;\n        max-height: 60px; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-counters {\n        display: inline-block;\n        float: right;\n        line-height: 35px;\n        font-size: .9em; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-messagecount {\n        padding-right: 15px; }\n        .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-messagecount i {\n          color: #77D017; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-usercount {\n        background-color: #F26B30;\n        display: inline-block;\n        line-height: 16px;\n        padding: 0 4px;\n        text-align: center;\n        border-radius: 3px;\n        font-weight: bold; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist li.nowtalk-admin__channellist-item-active .nowtalk-admin__chanellist-item-container {\n        background-color: #2F393E; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist li.nowtalk-admin__channellist-item-active .nowtalk-admin__chanellist-item-container:after {\n        display: block;\n        content: '';\n        background-color: #CECFCF;\n        position: absolute;\n        width: 5px;\n        height: 60px;\n        left: 100%;\n        margin-top: -47px; }\n    .nowtalk-admin__page .nowtalk-admin__channelarea .nowtalk-admin__channelarea-newChatButton {\n      background-color: #364147;\n      border: 2px solid #F06A2F;\n      width: 250px;\n      display: block;\n      margin: 0 auto;\n      position: absolute;\n      margin-left: 20px;\n      bottom: 20px;\n      color: #F06A2F;\n      padding: 10px 0;\n      text-transform: uppercase;\n      border-radius: 5px;\n      cursor: pointer;\n      font-weight: bold;\n      font-size: .9em;\n      outline: none; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea .nowtalk-admin__channelarea-newChatButton i {\n        font-size: .8em;\n        position: absolute;\n        left: 0%;\n        margin-left: 10px;\n        line-height: 16px; }\n    .nowtalk-admin__page .nowtalk-admin__channelarea .nowtalk-admin__channelarea-newChatButton:hover {\n      color: white;\n      background-color: #F06A2F; }\n  .nowtalk-admin__page .nowtalk-admin__header {\n    position: fixed;\n    right: 0;\n    background: white;\n    height: 75px;\n    left: 290px;\n    border-bottom: 1px solid #F4F4F4;\n    min-width: 830px;\n    z-index: 100000; }\n    .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbs {\n      margin-left: 15px;\n      display: inline-block;\n      float: left; }\n    .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbsList {\n      display: inline-block;\n      line-height: 75px;\n      list-style-type: none; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbsList li {\n        display: inline-block;\n        font-size: 20px;\n        color: #C4C5C7; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbsList li:after {\n        content: \"\\f105\";\n        margin: 0 8px;\n        font: normal normal normal 14px/1 FontAwesome;\n        font-size: 18px; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbsList li:last-child {\n        color: #323337; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbsList li:last-child:after {\n        content: ''; }\n    .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbs:after {\n      content: '';\n      display: table;\n      clear: both; }\n    .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-chatIndicator {\n      margin-left: 0px;\n      cursor: pointer;\n      border-left: 1px solid #F4F4F4;\n      float: left;\n      display: inline-block;\n      margin-top: 20px; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-chatIndicator img {\n        height: 35px;\n        display: inline-block;\n        float: left;\n        margin: 0 10px; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-chatIndicator img:after {\n        content: '';\n        display: block;\n        clear: both; }\n    .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-chatname {\n      display: inline-block;\n      float: left;\n      font-weight: 300;\n      font-size: 1.1em;\n      color: #F36B2F;\n      line-height: 35px; }\n  .nowtalk-admin__page .nowtalk-admin__user-header {\n    display: inline-block;\n    float: right;\n    padding: 0 5px;\n    margin-top: 12.5px;\n    cursor: pointer; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__user-avatar {\n      float: right;\n      margin: 0 8px 0 15px; }\n      .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__user-avatar img {\n        height: 50px;\n        border-radius: 5px; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__user-avatar:after {\n      content: \"\\f107\";\n      float: right;\n      padding: 0 0 0 8px;\n      padding-top: 18px;\n      font: normal normal normal 18px/1 FontAwesome;\n      color: #686868; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__username {\n      float: right;\n      text-align: right;\n      font-weight: bold;\n      font-size: 1.1em;\n      color: #747474;\n      display: table;\n      height: 50px; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__usernamewrap {\n      display: table-cell;\n      vertical-align: middle; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__user-status {\n      display: block;\n      text-align: right;\n      font-size: .99em;\n      font-weight: 300; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .online:before {\n      display: inline-block;\n      content: '';\n      height: 6px;\n      width: 6px;\n      border-radius: 50%;\n      margin: 0 .4em;\n      background-color: #77D115; }\n", ""]);
+	exports.push([module.id, "@font-face { }\n\n* {\n  margin: 0;\n  padding: 0; }\n\nbody, html {\n  width: 100%;\n  height: 100%;\n  font-size: 13px;\n  overflow: hidden; }\n\n.nowtalk-admin__wrapper {\n  width: 100%;\n  height: 100%; }\n\n.nowtalk-admin__page {\n  width: 100%;\n  height: 100%;\n  font-family: sans-serif; }\n  .nowtalk-admin__page .nowtalk-admin__main {\n    margin-left: 290px;\n    height: 100%; }\n    .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content {\n      float: left;\n      width: 100%;\n      min-width: 450px;\n      background: #F7F7F7;\n      height: 100%;\n      margin: 75px -300px 0 0;\n      overflow: auto; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentarea {\n        background: white;\n        width: 95%;\n        margin-left: auto;\n        margin-right: auto;\n        padding: 30px;\n        box-sizing: border-box;\n        border-left: 1px solid #F4F4F4;\n        border-bottom: 1px solid #F4F4F4;\n        border-right: 1px solid #F4F4F4;\n        color: #717171;\n        font-size: 15px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentarea a {\n          color: #F26C3B;\n          text-decoration: none; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentarea h5 {\n          font-size: 1em;\n          font-weight: 300; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentarea p {\n          font-size: 1.1em; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentarea p.big-helper {\n          font-size: .9em;\n          color: #6F6F6F; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons {\n        list-style-type: none;\n        margin: 20px 0;\n        padding-bottom: 20px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons a {\n          color: #A3A3A3; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li:first-child {\n          margin: 0 5px 0 0; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li {\n          display: inline-block;\n          width: 120px;\n          border: 1px solid #EBEBEB;\n          margin: 0 5px;\n          border-radius: 5px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li.active {\n          background-color: #F26C3B;\n          border: none; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li.active .fa, .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li.active .fi-social-blogger, .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li.active span {\n            color: white; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons li.active:after {\n          position: absolute;\n          display: block;\n          content: '';\n          width: 0;\n          height: 0;\n          border-style: solid;\n          margin-left: 50px;\n          border-width: 12px 12.5px 0 12.5px;\n          border-color: #F26C3B transparent transparent transparent; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons .nowtalk-admin__embedNowtalkLink {\n          display: block;\n          width: 100%;\n          height: 120px;\n          text-align: center; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons .nowtalk-admin__embedNowtalkLink i {\n            width: 100%;\n            font-size: 50px;\n            line-height: 85px; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons .nowtalk-admin__embedNowtalkLink .fi-social-blogger {\n            font-size: 65px; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__contentareaEmbedButtons .nowtalk-admin__embedNowtalkLink span {\n            width: 100%;\n            font-size: .9em;\n            display: inline-block; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .install-link {\n        padding-bottom: 1em; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__embedCodeTextarea {\n        display: block;\n        resize: none;\n        width: 60%;\n        height: 200px;\n        margin: 10px 0;\n        border-radius: 3px;\n        border: 1px solid #D5D5D5;\n        background-color: #F7F7F7;\n        outline: none;\n        padding: 10px;\n        box-sizing: border-box;\n        color: #A3A3A3; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings button {\n        border: none;\n        font-size: 1em;\n        cursor: pointer;\n        outline: none;\n        padding: 8px 20px;\n        border-radius: 5px;\n        margin-right: 10px; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__discardPrivacySettingsButton {\n        background-color: #EDEDED;\n        color: #464A4D; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__discardPrivacySettingsButton:hover {\n        background-color: #F8F8F8; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__savePrivacySettingsButton {\n        background-color: #F16C39;\n        color: white; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__bad-words {\n        font-size: .8em;\n        line-height: 1em; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__bad-words li {\n          display: inline-block;\n          padding: 0 5px;\n          margin: 3px 3px;\n          background-color: white;\n          border: 1px solid #EDEDED;\n          line-height: 1.8em;\n          border-radius: 2px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettings .nowtalk-admin__bad-words i {\n          padding-left: 5px;\n          cursor: pointer; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList {\n        border-bottom: 1px solid #ECECEC;\n        padding-bottom: 20px;\n        margin-bottom: 40px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList ul {\n          list-style-type: none; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList li {\n          margin: 5px 0;\n          max-width: 350px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting {\n          display: inline-block;\n          width: 350px; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .name {\n            font-size: 1em;\n            display: inline-block;\n            float: left;\n            width: 250px;\n            font-size: 1.05em;\n            line-height: 44px; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__privacySettingInput {\n            display: inline-block;\n            float: left;\n            width: 307px;\n            line-height: 40px; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__privacySettingInput input {\n              width: 100%;\n              border: 1px solid #DBDBDB;\n              padding: 5px;\n              border-radius: 5px;\n              outline: none;\n              background-color: #F7F7F7; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__help {\n            display: inline-block;\n            float: right;\n            line-height: 40px; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__help i {\n              border: 2px solid #BDBDBD;\n              color: #BDBDBD;\n              width: 14px;\n              line-height: 14px;\n              text-align: center;\n              border-radius: 50%;\n              font-size: 12px;\n              cursor: pointer; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__helper {\n            display: none;\n            position: absolute;\n            width: 300px;\n            line-height: 1em;\n            border: 1px solid #DADADA;\n            border-radius: 3px;\n            padding: .6em;\n            font-size: .9em;\n            background-color: white;\n            z-index: 10000000;\n            margin-left: 13px;\n            margin-top: -2px;\n            box-shadow: 1px 1px 5px 0px rgba(50, 50, 50, 0.25); }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__helper.active {\n            display: inline-block;\n            background-color: white; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__helper:after {\n            display: inline-block;\n            top: 13px;\n            right: 100%;\n            position: absolute;\n            content: '';\n            border-style: solid;\n            border-width: 8px 12px 8px 0;\n            border-color: transparent #DCDCDC transparent transparent; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__privacySettingsList .nowtalk-admin__privacySetting .nowtalk-admin__switcher {\n            float: left;\n            padding: 10px; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info {\n        min-width: 750px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info button.nowtalk-admin__save-info-settings {\n          background-color: #F16C39;\n          color: white; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info button.nowtalk-admin__discard-info-settings {\n          background-color: #EDEDED;\n          color: #464A4D; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info button.nowtalk-admin__discard-info-settings:hover {\n          background-color: #F8F8F8; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info button {\n          border: none;\n          font-size: 1em;\n          cursor: pointer;\n          outline: none;\n          padding: 8px 20px;\n          border-radius: 5px;\n          margin-right: 10px; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info:after {\n        content: ' ';\n        display: table;\n        clear: both; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList {\n        float: left;\n        display: inline-block;\n        width: 410px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList ul {\n          list-style-type: none;\n          border-bottom: 1px solid #ECECEC;\n          padding-bottom: 20px;\n          margin-bottom: 40px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList li {\n          margin: 5px 0;\n          width: 370px;\n          margin-bottom: 18px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting {\n          display: inline-block;\n          width: 100%; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .label-field {\n            display: inline-block;\n            float: left;\n            width: 340px;\n            padding: 0 0 5px 0; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .label-field label {\n              font-size: 1em; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .nowtalk-admin__upload-avatar {\n            display: inline-block;\n            margin: 10px 0; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .nowtalk-admin__upload-avatar img {\n              display: inline-block;\n              float: left;\n              margin-right: 10px; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .nowtalk-admin__upload-avatar span {\n              display: inline-block;\n              width: 250px;\n              font-size: .8em;\n              padding-top: 5px;\n              color: #B8B8B8; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .nowtalk-admin__upload-avatar button {\n              display: inline-block;\n              border: none;\n              background-color: #EDEDED;\n              padding: 7px 10px;\n              margin: 0 7px 0 0;\n              outline: none;\n              cursor: pointer;\n              border-radius: 3px;\n              color: #3E4446; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .nowtalk-admin__upload-avatar button.nowtalk-admin__upload-avatar-remove {\n              background: none; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .input-field {\n            float: left;\n            width: 340px; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .input-field input, .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .input-field textarea {\n              width: 100%;\n              font-size: .9em;\n              border-radius: 3px;\n              padding: 6px 10px;\n              color: #727272;\n              border: 1px solid #DBDBDB;\n              padding: 5px;\n              outline: none;\n              background-color: #F7F7F7;\n              box-sizing: border-box; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .input-field .active-input {\n              border-color: #E83C3F;\n              border-width: 2px; }\n            .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .input-field textarea {\n              display: block;\n              resize: none;\n              height: 3em;\n              font-size: .9em;\n              font-family: sans-serif; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .nowtalk-admin__switcher {\n            float: right; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .nowtalk-admin__help {\n            float: right;\n            padding: 0 0 0 10px;\n            line-height: 1.8em; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .nowtalk-admin__helper {\n            margin-top: -8px; }\n          .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-settingList .nowtalk-admin__chat-info-setting .nowtalk-admin__help.greeting {\n            line-height: 1em; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-nowtalk-preview {\n        float: right;\n        display: inline-block;\n        width: 300px; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-nowtalk-preview h6 {\n          font-size: 1em;\n          font-weight: 300;\n          text-transform: uppercase;\n          text-align: center;\n          color: #B8B9BA; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__chat-info-nowtalk-preview .nowtalk-admin__nowtalk-preview {\n          margin: 0 auto;\n          padding-top: 10px;\n          text-align: center; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__help {\n        display: inline-block; }\n        .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__help i {\n          border: 2px solid #BDBDBD;\n          color: #BDBDBD;\n          width: 14px;\n          line-height: 14px;\n          text-align: center;\n          border-radius: 50%;\n          font-size: 12px;\n          cursor: pointer; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__helper {\n        display: none;\n        position: absolute;\n        width: 170px;\n        line-height: 1em;\n        border: 1px solid #DADADA;\n        border-radius: 3px;\n        padding: .6em;\n        font-size: .9em;\n        background-color: white;\n        z-index: 10000000;\n        margin-left: 13px;\n        margin-top: -2px;\n        box-shadow: 1px 1px 5px 0px rgba(50, 50, 50, 0.25); }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__helper.active {\n        display: inline-block;\n        background-color: white; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__content .nowtalk-admin__helper:after {\n        display: inline-block;\n        top: 13px;\n        right: 100%;\n        position: absolute;\n        content: '';\n        border-style: solid;\n        border-width: 8px 12px 8px 0;\n        border-color: transparent #DCDCDC transparent transparent; }\n    .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__switcher {\n      display: inline-block; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__switcher .text-indicator {\n        float: left;\n        line-height: 22px;\n        font-size: .9em;\n        padding-right: 7px; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__switcher .switcherContainer {\n        display: inline-block;\n        background-color: #F7F7F7;\n        border: 1px solid #D1D1D1;\n        border-radius: 3px;\n        padding: 3px;\n        height: 22px;\n        box-sizing: border-box;\n        cursor: pointer;\n        float: right;\n        width: 35px; }\n      .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__switcher .switch {\n        height: 100%;\n        width: 14px;\n        border-radius: 2px;\n        background-color: #D4D4D4;\n        float: left; }\n    .nowtalk-admin__page .nowtalk-admin__main .switch-on .switch {\n      float: right;\n      background-color: #79D03A; }\n    .nowtalk-admin__page .nowtalk-admin__main .switch-off .switch {\n      float: left;\n      background-color: #C04444; }\n    .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__formarea {\n      float: right;\n      background: #efefef;\n      height: 100%;\n      margin: 75px 0 0 0;\n      -webkit-animation: slide 0.5s forwards;\n      -webkit-animation-delay: 2s;\n      -webkit-animation: slide 0.5s forwards;\n              animation: slide 0.5s forwards;\n      -webkit-animation-delay: 2s;\n              animation-delay: 2s;\n      transition: all 1s ease-in-out; }\n    .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__formarea-init {\n      width: 0px; }\n    .nowtalk-admin__page .nowtalk-admin__main .nowtalk-admin__formarea-final {\n      width: 300px; }\n  .nowtalk-admin__page .nowtalk-admin__channelarea {\n    position: fixed;\n    float: left;\n    left: 0;\n    top: 0;\n    width: 290px;\n    height: 100%;\n    background: #364147;\n    color: white; }\n    .nowtalk-admin__page .nowtalk-admin__channelarea .nowtalk-admin__channelheader {\n      height: 75px;\n      width: 100%; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea .nowtalk-admin__channelheader img {\n        display: block;\n        margin: 0 auto;\n        height: 37px;\n        padding-top: 19px; }\n    .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist {\n      margin: 0;\n      padding: 0;\n      padding-left: 8px; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist ul {\n        margin-left: 30px;\n        list-style-type: none; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist li {\n        border-bottom: 1px solid #333D42;\n        border-top: 1px solid #374146; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .subsub li {\n        border: none; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .subsub span {\n        color: #66737B; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-submenu .submenu-item-container {\n        padding: 12px 0;\n        font-weight: bold; }\n        .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-submenu .submenu-item-container i {\n          color: #66737B;\n          width: 25px; }\n        .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-submenu .submenu-item-container i.fa-plus, .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-submenu .submenu-item-container i.fa-minus {\n          float: right;\n          padding-right: 13px;\n          font-size: .8em;\n          width: 10px; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist li.nowtalk-admin__channellist-item {\n        cursor: pointer; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-container {\n        padding: 12px 12px 12px 7px; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-icon, .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-photo {\n        display: inline-block;\n        float: left;\n        width: 35px;\n        overflow: hidden; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-icon:after, .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-photo:after {\n        content: '';\n        display: block;\n        clear: both; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-icon {\n        font-size: 20px;\n        color: #5D6A72;\n        line-height: 35px; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-photo {\n        padding: 0 8px 0 0; }\n        .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__chanellist-item-photo img {\n          max-width: 100%; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-name {\n        display: inline-block;\n        font-weight: bold;\n        line-height: 35px;\n        font-size: .9em;\n        max-width: 105px;\n        white-space: nowrap;\n        max-height: 60px; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-counters {\n        display: inline-block;\n        float: right;\n        line-height: 35px;\n        font-size: .9em; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-messagecount {\n        padding-right: 15px; }\n        .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-messagecount i {\n          color: #77D017; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist .nowtalk-admin__channellist-item-usercount {\n        background-color: #F26B30;\n        display: inline-block;\n        line-height: 16px;\n        padding: 0 4px;\n        text-align: center;\n        border-radius: 3px;\n        font-weight: bold; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist li.nowtalk-admin__channellist-item-active .nowtalk-admin__chanellist-item-container {\n        background-color: #2F393E; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea ul.nowtalk-admin__channellist li.nowtalk-admin__channellist-item-active .nowtalk-admin__chanellist-item-container:after {\n        display: block;\n        content: '';\n        background-color: #CECFCF;\n        position: absolute;\n        width: 5px;\n        height: 60px;\n        left: 100%;\n        margin-top: -47px; }\n    .nowtalk-admin__page .nowtalk-admin__channelarea .nowtalk-admin__channelarea-newChatButton {\n      background-color: #364147;\n      border: 2px solid #F06A2F;\n      width: 250px;\n      display: block;\n      margin: 0 auto;\n      position: absolute;\n      margin-left: 20px;\n      bottom: 20px;\n      color: #F06A2F;\n      padding: 10px 0;\n      text-transform: uppercase;\n      border-radius: 5px;\n      cursor: pointer;\n      font-weight: bold;\n      font-size: .9em;\n      outline: none; }\n      .nowtalk-admin__page .nowtalk-admin__channelarea .nowtalk-admin__channelarea-newChatButton i {\n        font-size: .8em;\n        position: absolute;\n        left: 0%;\n        margin-left: 10px;\n        line-height: 16px; }\n    .nowtalk-admin__page .nowtalk-admin__channelarea .nowtalk-admin__channelarea-newChatButton:hover {\n      color: white;\n      background-color: #F06A2F; }\n  .nowtalk-admin__page .nowtalk-admin__header {\n    position: fixed;\n    right: 0;\n    background: white;\n    height: 75px;\n    left: 290px;\n    border-bottom: 1px solid #F4F4F4;\n    min-width: 830px;\n    z-index: 100000; }\n    .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbs {\n      margin-left: 15px;\n      display: inline-block;\n      float: left; }\n    .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbsList {\n      display: inline-block;\n      line-height: 75px;\n      list-style-type: none; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbsList li {\n        display: inline-block;\n        font-size: 20px;\n        color: #C4C5C7; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbsList li:after {\n        content: \"\\f105\";\n        margin: 0 8px;\n        font: normal normal normal 14px/1 FontAwesome;\n        font-size: 18px; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbsList li:last-child {\n        color: #323337; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbsList li:last-child:after {\n        content: ''; }\n    .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-breadcrumbs:after {\n      content: '';\n      display: table;\n      clear: both; }\n    .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-chatIndicator {\n      margin-left: 0px;\n      cursor: pointer;\n      border-left: 1px solid #F4F4F4;\n      float: left;\n      display: inline-block;\n      margin-top: 20px; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-chatIndicator img {\n        height: 35px;\n        display: inline-block;\n        float: left;\n        margin: 0 10px; }\n      .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-chatIndicator img:after {\n        content: '';\n        display: block;\n        clear: both; }\n    .nowtalk-admin__page .nowtalk-admin__header .nowtalk-admin__header-chatname {\n      display: inline-block;\n      float: left;\n      font-weight: 300;\n      font-size: 1.1em;\n      color: #F36B2F;\n      line-height: 35px; }\n  .nowtalk-admin__page .nowtalk-admin__user-header {\n    display: inline-block;\n    float: right;\n    padding: 0 5px;\n    margin-top: 12.5px;\n    cursor: pointer; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__user-avatar {\n      float: right;\n      margin: 0 8px 0 15px; }\n      .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__user-avatar img {\n        height: 50px;\n        border-radius: 5px; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__user-avatar:after {\n      content: \"\\f107\";\n      float: right;\n      padding: 0 0 0 8px;\n      padding-top: 18px;\n      font: normal normal normal 18px/1 FontAwesome;\n      color: #686868; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__username {\n      float: right;\n      text-align: right;\n      font-weight: bold;\n      font-size: 1.1em;\n      color: #747474;\n      display: table;\n      height: 50px; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__usernamewrap {\n      display: table-cell;\n      vertical-align: middle; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .nowtalk-admin__user-status {\n      display: block;\n      text-align: right;\n      font-size: .99em;\n      font-weight: 300; }\n    .nowtalk-admin__page .nowtalk-admin__user-header .online:before {\n      display: inline-block;\n      content: '';\n      height: 6px;\n      width: 6px;\n      border-radius: 50%;\n      margin: 0 .4em;\n      background-color: #77D115; }\n", ""]);
 
 /***/ },
 /* 4 */
@@ -418,7 +888,7 @@
 /* 7 */
 /***/ function(module, exports, __webpack_require__) {
 
-	module.exports = __webpack_require__(13);
+	module.exports = __webpack_require__(14);
 
 
 /***/ },
@@ -453,7 +923,7 @@
 	 *     */
 	!(__WEBPACK_AMD_DEFINE_ARRAY__ = [
 	  __webpack_require__(7),
-	  __webpack_require__(14)
+	  __webpack_require__(15)
 	], __WEBPACK_AMD_DEFINE_RESULT__ = function(
 	  React,
 	  User
@@ -495,7 +965,7 @@
 	 *     */
 	!(__WEBPACK_AMD_DEFINE_ARRAY__ = [
 	  __webpack_require__(7),
-	  __webpack_require__(15)
+	  __webpack_require__(16)
 	], __WEBPACK_AMD_DEFINE_RESULT__ = function(
 	  React,
 	  ChannelList
@@ -534,12 +1004,14 @@
 	 *     */
 	!(__WEBPACK_AMD_DEFINE_ARRAY__ = [
 	  __webpack_require__(7),
-	  __webpack_require__(16),
-	  __webpack_require__(17)
+	  __webpack_require__(17),
+	  __webpack_require__(18),
+	  __webpack_require__(19)
 	], __WEBPACK_AMD_DEFINE_RESULT__ = function(
 	  React,
 	  EmbedInstructions,
-	  PrivacySettings
+	  PrivacySettings,
+	  ChatInfo
 	){
 	  var Content;
 
@@ -553,7 +1025,8 @@
 	      return(
 	        React.createElement("div", {className: "nowtalk-admin__content"}, 
 	          /*<EmbedInstructions />*/
-	          React.createElement(PrivacySettings, null)
+	          /*<PrivacySettings />*/
+	          React.createElement(ChatInfo, null)
 	        )
 	      );
 	    }
@@ -614,7 +1087,8 @@
 
 
 /***/ },
-/* 13 */
+/* 13 */,
+/* 14 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -637,18 +1111,18 @@
 
 	'use strict';
 
-	var LinkedStateMixin = __webpack_require__(20);
-	var React = __webpack_require__(21);
+	var LinkedStateMixin = __webpack_require__(21);
+	var React = __webpack_require__(22);
 	var ReactComponentWithPureRenderMixin =
-	  __webpack_require__(22);
-	var ReactCSSTransitionGroup = __webpack_require__(23);
-	var ReactFragment = __webpack_require__(24);
-	var ReactTransitionGroup = __webpack_require__(25);
-	var ReactUpdates = __webpack_require__(19);
+	  __webpack_require__(23);
+	var ReactCSSTransitionGroup = __webpack_require__(24);
+	var ReactFragment = __webpack_require__(25);
+	var ReactTransitionGroup = __webpack_require__(26);
+	var ReactUpdates = __webpack_require__(20);
 
-	var cx = __webpack_require__(26);
-	var cloneWithProps = __webpack_require__(27);
-	var update = __webpack_require__(28);
+	var cx = __webpack_require__(27);
+	var cloneWithProps = __webpack_require__(28);
+	var update = __webpack_require__(29);
 
 	React.addons = {
 	  CSSTransitionGroup: ReactCSSTransitionGroup,
@@ -664,16 +1138,16 @@
 	};
 
 	if ("production" !== process.env.NODE_ENV) {
-	  React.addons.Perf = __webpack_require__(29);
-	  React.addons.TestUtils = __webpack_require__(30);
+	  React.addons.Perf = __webpack_require__(30);
+	  React.addons.TestUtils = __webpack_require__(31);
 	}
 
 	module.exports = React;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 14 */
+/* 15 */
 /***/ function(module, exports, __webpack_require__) {
 
 	var __WEBPACK_AMD_DEFINE_ARRAY__, __WEBPACK_AMD_DEFINE_RESULT__;/**
@@ -711,7 +1185,7 @@
 
 
 /***/ },
-/* 15 */
+/* 16 */
 /***/ function(module, exports, __webpack_require__) {
 
 	var __WEBPACK_AMD_DEFINE_ARRAY__, __WEBPACK_AMD_DEFINE_RESULT__;/**
@@ -721,7 +1195,7 @@
 	 *     */
 	!(__WEBPACK_AMD_DEFINE_ARRAY__ = [
 	  __webpack_require__(7),
-	  __webpack_require__(18)
+	  __webpack_require__(32)
 	], __WEBPACK_AMD_DEFINE_RESULT__ = function(
 	  React,
 	  ChannelListItem
@@ -892,7 +1366,7 @@
 
 
 /***/ },
-/* 16 */
+/* 17 */
 /***/ function(module, exports, __webpack_require__) {
 
 	var __WEBPACK_AMD_DEFINE_ARRAY__, __WEBPACK_AMD_DEFINE_RESULT__;!(__WEBPACK_AMD_DEFINE_ARRAY__ = [
@@ -951,7 +1425,7 @@
 	}.apply(exports, __WEBPACK_AMD_DEFINE_ARRAY__), __WEBPACK_AMD_DEFINE_RESULT__ !== undefined && (module.exports = __WEBPACK_AMD_DEFINE_RESULT__));
 
 /***/ },
-/* 17 */
+/* 18 */
 /***/ function(module, exports, __webpack_require__) {
 
 	var __WEBPACK_AMD_DEFINE_ARRAY__, __WEBPACK_AMD_DEFINE_RESULT__;!(__WEBPACK_AMD_DEFINE_ARRAY__ = [
@@ -1066,47 +1540,139 @@
 	}.apply(exports, __WEBPACK_AMD_DEFINE_ARRAY__), __WEBPACK_AMD_DEFINE_RESULT__ !== undefined && (module.exports = __WEBPACK_AMD_DEFINE_RESULT__));
 
 /***/ },
-/* 18 */
+/* 19 */
 /***/ function(module, exports, __webpack_require__) {
 
-	var __WEBPACK_AMD_DEFINE_ARRAY__, __WEBPACK_AMD_DEFINE_RESULT__;/**
-	 *  * The main UI component.
-	 *   *
-	 *    * @module view/ChannelListItem
-	 *     */
-	!(__WEBPACK_AMD_DEFINE_ARRAY__ = [
-	  __webpack_require__(7)
+	var __WEBPACK_AMD_DEFINE_ARRAY__, __WEBPACK_AMD_DEFINE_RESULT__;!(__WEBPACK_AMD_DEFINE_ARRAY__ = [
+	  __webpack_require__(7),
+	  __webpack_require__(33)
 	], __WEBPACK_AMD_DEFINE_RESULT__ = function(
-	  React
+	  React,
+	  NowtalkPreview
 	){
-	  var ChannelListItem;
-	  ChannelListItem = React.createClass({displayName: "ChannelListItem",
-	    render: function(){ 
-	      var classes = "nowtalk-admin__channellist-item ";
-	      if(this.props.active) classes += "nowtalk-admin__channellist-item-active";
+	  var ChatInfo;
 
+	  ChatInfo = React.createClass({displayName: "ChatInfo",
+	    getDefaultProps: function(){
+	      return {
+	        breadcrumbs: 'Admin Panel'
+	      }
+	    },
+	    render: function(){ 
 	      return(
-	        React.createElement("li", {className: classes}, 
-	          React.createElement("div", {className: "nowtalk-admin__channellist-item-name"}, this.props.name), 
-	          React.createElement("div", {className: "nowtalk-admin__channellist-item-counters"}, 
-	            React.createElement("span", {className: "nowtalk-admin__channellist-item-messagecount"}, 
-	              React.createElement("i", {className: "fa fa-comment"}), " ", this.props.messageCount
+	        React.createElement("div", {className: "nowtalk-admin__contentarea"}, 
+	          React.createElement("div", {className: "nowtalk-admin__chat-info"}, 
+	            React.createElement("div", {className: "nowtalk-admin__chat-info-settingList"}, 
+	              React.createElement("ul", null, 
+	                React.createElement("li", null, 
+	                  React.createElement("div", {className: "nowtalk-admin__chat-info-setting"}, 
+	                    React.createElement("div", {className: "label-field"}, 
+	                      React.createElement("label", null, "URL to Embed Chat")
+	                    ), 
+	                    React.createElement("div", {className: "input-field"}, React.createElement("input", {type: "text"})), 
+	                    React.createElement("div", {className: "nowtalk-admin__help"}, 
+	                      React.createElement("i", {className: "fa fa-question"}), 
+	                      React.createElement("div", {className: "nowtalk-admin__helper"}, "Lorem ipsum dolor sit amet, consectetur adipisicing elit. Natus, non!")
+	                    )
+	                  )
+	                ), 
+	                React.createElement("li", null, 
+	                  React.createElement("div", {className: "nowtalk-admin__chat-info-setting"}, 
+	                    React.createElement("div", {className: "label-field"}, 
+	                      React.createElement("label", null, "Chat Title")
+	                    ), 
+	                    React.createElement("div", {className: "input-field"}, React.createElement("input", {type: "text"})), 
+	                    React.createElement("div", {className: "nowtalk-admin__help"}, 
+	                      React.createElement("i", {className: "fa fa-question"}), 
+	                      React.createElement("div", {className: "nowtalk-admin__helper"}, "Lorem ipsum dolor sit amet, consectetur adipisicing elit. Natus, non!")
+	                    )
+	                  )
+	                ), 
+	                React.createElement("li", null, 
+	                  React.createElement("div", {className: "nowtalk-admin__chat-info-setting"}, 
+	                    React.createElement("div", {className: "label-field"}, 
+	                      React.createElement("label", null, "Current Topic")
+	                    ), 
+	                    React.createElement("div", {className: "input-field"}, React.createElement("input", {type: "text", className: "active-input"})), 
+	                    React.createElement("div", {className: "nowtalk-admin__help"}, 
+	                      React.createElement("i", {className: "fa fa-question"}), 
+	                      React.createElement("div", {className: "nowtalk-admin__helper"}, "Lorem ipsum dolor sit amet, consectetur adipisicing elit. Natus, non!")
+	                    )
+	                  )
+	                ), 
+	                React.createElement("li", null, 
+	                  React.createElement("div", {className: "nowtalk-admin__chat-info-setting"}, 
+	                    React.createElement("div", {className: "label-field"}, 
+	                      React.createElement("label", null, "Chat Avatar")
+	                    ), 
+	                    React.createElement("div", {className: "nowtalk-admin__upload-avatar"}, 
+	                      React.createElement("img", {src: "./images/default-avatar.png"}), 
+	                      React.createElement("button", {className: "nowtalk-admin__upload-avatar-upload"}, "Upload New Avatar"), 
+	                      React.createElement("button", {className: "nowtalk-admin__upload-avatar-remove"}, "Remove Avatar"), 
+	                      React.createElement("span", null, 'Want to look you best? Make sure to upload a photo that\' at least 192px in width and height.')
+	                    )
+	                  )
+	                ), 
+	                React.createElement("li", null, 
+	                  React.createElement("div", {className: "nowtalk-admin__chat-info-setting"}, 
+	                    React.createElement("div", {className: "label-field"}, 
+	                      React.createElement("label", null, "Greeting"), 
+	                      React.createElement("div", {className: "nowtalk-admin__switcher switch-off"}, 
+	                        React.createElement("div", {className: "text-indicator"}, "Off"), 
+	                        React.createElement("div", {className: "switcherContainer"}, 
+	                          React.createElement("div", {className: "switch"})
+	                        )
+	                      )
+	                    ), 
+	                    React.createElement("div", {className: "nowtalk-admin__help greeting"}, 
+	                      React.createElement("i", {className: "fa fa-question"}), 
+	                      React.createElement("div", {className: "nowtalk-admin__helper"}, "Lorem ipsum dolor sit amet, consectetur adipisicing elit. Natus, non!")
+	                    ), 
+	                    React.createElement("div", {className: "input-field"}, React.createElement("textarea", null))
+	                  )
+	                ), 
+	                React.createElement("li", null, 
+	                  React.createElement("div", {className: "nowtalk-admin__chat-info-setting"}, 
+	                    React.createElement("div", {className: "label-field"}, 
+	                      React.createElement("label", null, "Call-to-Action ")
+	                    ), 
+	                    React.createElement("div", {className: "input-field"}, React.createElement("input", {type: "text"})), 
+	                    React.createElement("div", {className: "nowtalk-admin__help"}, 
+	                      React.createElement("i", {className: "fa fa-question"}), 
+	                      React.createElement("div", {className: "nowtalk-admin__helper"}, "Lorem ipsum dolor sit amet, consectetur adipisicing elit. Natus, non!")
+	                    )
+	                  )
+	                ), 
+	                React.createElement("li", null, 
+	                  React.createElement("div", {className: "nowtalk-admin__chat-info-setting"}, 
+	                    React.createElement("div", {className: "label-field"}, 
+	                      React.createElement("label", null, "Guest Moniker")
+	                    ), 
+	                    React.createElement("div", {className: "input-field"}, React.createElement("input", {type: "text"})), 
+	                    React.createElement("div", {className: "nowtalk-admin__help"}, 
+	                      React.createElement("i", {className: "fa fa-question"}), 
+	                      React.createElement("div", {className: "nowtalk-admin__helper active"}, "Lorem ipsum dolor sit amet, consectetur adipisicing elit. Natus, non!")
+	                    )
+	                  )
+	                )
+	              ), 
+	              React.createElement("button", {className: "nowtalk-admin__save-info-settings"}, "Save Changes"), 
+	              React.createElement("button", {className: "nowtalk-admin__discard-info-settings"}, "Cancel/Discard Changes")
 	            ), 
-	            React.createElement("span", {className: "nowtalk-admin__channellist-item-usercount"}, 
-	              React.createElement("i", {className: "fa fa-user"}), "  ", this.props.userCount
+	            React.createElement("div", {className: "nowtalk-admin__chat-info-nowtalk-preview"}, 
+	              React.createElement("h6", null, "Preview"), 
+	              React.createElement(NowtalkPreview, null)
 	            )
 	          )
 	        )
 	      );
 	    }
 	  });
-
-	  return ChannelListItem;
+	  return ChatInfo;
 	}.apply(exports, __WEBPACK_AMD_DEFINE_ARRAY__), __WEBPACK_AMD_DEFINE_RESULT__ !== undefined && (module.exports = __WEBPACK_AMD_DEFINE_RESULT__));
 
-
 /***/ },
-/* 19 */
+/* 20 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -1122,16 +1688,16 @@
 
 	'use strict';
 
-	var CallbackQueue = __webpack_require__(32);
-	var PooledClass = __webpack_require__(33);
-	var ReactCurrentOwner = __webpack_require__(34);
-	var ReactPerf = __webpack_require__(35);
-	var ReactReconciler = __webpack_require__(36);
-	var Transaction = __webpack_require__(37);
+	var CallbackQueue = __webpack_require__(35);
+	var PooledClass = __webpack_require__(36);
+	var ReactCurrentOwner = __webpack_require__(37);
+	var ReactPerf = __webpack_require__(38);
+	var ReactReconciler = __webpack_require__(39);
+	var Transaction = __webpack_require__(40);
 
-	var assign = __webpack_require__(38);
-	var invariant = __webpack_require__(39);
-	var warning = __webpack_require__(40);
+	var assign = __webpack_require__(41);
+	var invariant = __webpack_require__(42);
+	var warning = __webpack_require__(43);
 
 	var dirtyComponents = [];
 	var asapCallbackQueue = CallbackQueue.getPooled();
@@ -1388,10 +1954,10 @@
 
 	module.exports = ReactUpdates;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 20 */
+/* 21 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -1408,8 +1974,8 @@
 
 	'use strict';
 
-	var ReactLink = __webpack_require__(41);
-	var ReactStateSetters = __webpack_require__(42);
+	var ReactLink = __webpack_require__(61);
+	var ReactStateSetters = __webpack_require__(62);
 
 	/**
 	 * A simple mixin around ReactLink.forState().
@@ -1436,7 +2002,7 @@
 
 
 /***/ },
-/* 21 */
+/* 22 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -1454,27 +2020,27 @@
 
 	'use strict';
 
-	var EventPluginUtils = __webpack_require__(43);
-	var ReactChildren = __webpack_require__(44);
-	var ReactComponent = __webpack_require__(45);
-	var ReactClass = __webpack_require__(46);
-	var ReactContext = __webpack_require__(47);
-	var ReactCurrentOwner = __webpack_require__(34);
-	var ReactElement = __webpack_require__(48);
-	var ReactElementValidator = __webpack_require__(49);
-	var ReactDOM = __webpack_require__(50);
-	var ReactDOMTextComponent = __webpack_require__(51);
-	var ReactDefaultInjection = __webpack_require__(52);
-	var ReactInstanceHandles = __webpack_require__(53);
-	var ReactMount = __webpack_require__(54);
-	var ReactPerf = __webpack_require__(35);
-	var ReactPropTypes = __webpack_require__(55);
-	var ReactReconciler = __webpack_require__(36);
-	var ReactServerRendering = __webpack_require__(56);
+	var EventPluginUtils = __webpack_require__(44);
+	var ReactChildren = __webpack_require__(45);
+	var ReactComponent = __webpack_require__(46);
+	var ReactClass = __webpack_require__(47);
+	var ReactContext = __webpack_require__(48);
+	var ReactCurrentOwner = __webpack_require__(37);
+	var ReactElement = __webpack_require__(49);
+	var ReactElementValidator = __webpack_require__(50);
+	var ReactDOM = __webpack_require__(51);
+	var ReactDOMTextComponent = __webpack_require__(52);
+	var ReactDefaultInjection = __webpack_require__(53);
+	var ReactInstanceHandles = __webpack_require__(54);
+	var ReactMount = __webpack_require__(55);
+	var ReactPerf = __webpack_require__(38);
+	var ReactPropTypes = __webpack_require__(56);
+	var ReactReconciler = __webpack_require__(39);
+	var ReactServerRendering = __webpack_require__(57);
 
-	var assign = __webpack_require__(38);
-	var findDOMNode = __webpack_require__(57);
-	var onlyChild = __webpack_require__(58);
+	var assign = __webpack_require__(41);
+	var findDOMNode = __webpack_require__(58);
+	var onlyChild = __webpack_require__(59);
 
 	ReactDefaultInjection.inject();
 
@@ -1540,7 +2106,7 @@
 	}
 
 	if ("production" !== process.env.NODE_ENV) {
-	  var ExecutionEnvironment = __webpack_require__(59);
+	  var ExecutionEnvironment = __webpack_require__(60);
 	  if (ExecutionEnvironment.canUseDOM && window.top === window.self) {
 
 	    // If we're in Chrome, look for the devtools marker and provide a download
@@ -1588,10 +2154,10 @@
 
 	module.exports = React;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 22 */
+/* 23 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -1607,7 +2173,7 @@
 
 	'use strict';
 
-	var shallowEqual = __webpack_require__(60);
+	var shallowEqual = __webpack_require__(63);
 
 	/**
 	 * If your React component's render function is "pure", e.g. it will render the
@@ -1644,7 +2210,7 @@
 
 
 /***/ },
-/* 23 */
+/* 24 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -1661,15 +2227,15 @@
 
 	'use strict';
 
-	var React = __webpack_require__(21);
+	var React = __webpack_require__(22);
 
-	var assign = __webpack_require__(38);
+	var assign = __webpack_require__(41);
 
 	var ReactTransitionGroup = React.createFactory(
-	  __webpack_require__(25)
+	  __webpack_require__(26)
 	);
 	var ReactCSSTransitionGroupChild = React.createFactory(
-	  __webpack_require__(61)
+	  __webpack_require__(64)
 	);
 
 	var ReactCSSTransitionGroup = React.createClass({
@@ -1718,7 +2284,7 @@
 
 
 /***/ },
-/* 24 */
+/* 25 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -1734,9 +2300,9 @@
 
 	'use strict';
 
-	var ReactElement = __webpack_require__(48);
+	var ReactElement = __webpack_require__(49);
 
-	var warning = __webpack_require__(40);
+	var warning = __webpack_require__(43);
 
 	/**
 	 * We used to allow keyed objects to serve as a collection of ReactElements,
@@ -1903,10 +2469,10 @@
 
 	module.exports = ReactFragment;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 25 */
+/* 26 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -1922,12 +2488,12 @@
 
 	'use strict';
 
-	var React = __webpack_require__(21);
-	var ReactTransitionChildMapping = __webpack_require__(62);
+	var React = __webpack_require__(22);
+	var ReactTransitionChildMapping = __webpack_require__(65);
 
-	var assign = __webpack_require__(38);
-	var cloneWithProps = __webpack_require__(27);
-	var emptyFunction = __webpack_require__(63);
+	var assign = __webpack_require__(41);
+	var cloneWithProps = __webpack_require__(28);
+	var emptyFunction = __webpack_require__(66);
 
 	var ReactTransitionGroup = React.createClass({
 	  displayName: 'ReactTransitionGroup',
@@ -2140,7 +2706,7 @@
 
 
 /***/ },
-/* 26 */
+/* 27 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -2171,7 +2737,7 @@
 	 */
 
 	'use strict';
-	var warning = __webpack_require__(40);
+	var warning = __webpack_require__(43);
 
 	var warned = false;
 
@@ -2196,10 +2762,10 @@
 
 	module.exports = cx;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 27 */
+/* 28 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -2216,11 +2782,11 @@
 
 	'use strict';
 
-	var ReactElement = __webpack_require__(48);
-	var ReactPropTransferer = __webpack_require__(64);
+	var ReactElement = __webpack_require__(49);
+	var ReactPropTransferer = __webpack_require__(67);
 
-	var keyOf = __webpack_require__(65);
-	var warning = __webpack_require__(40);
+	var keyOf = __webpack_require__(68);
+	var warning = __webpack_require__(43);
 
 	var CHILDREN_PROP = keyOf({children: null});
 
@@ -2258,10 +2824,10 @@
 
 	module.exports = cloneWithProps;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 28 */
+/* 29 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -2279,9 +2845,9 @@
 
 	'use strict';
 
-	var assign = __webpack_require__(38);
-	var keyOf = __webpack_require__(65);
-	var invariant = __webpack_require__(39);
+	var assign = __webpack_require__(41);
+	var keyOf = __webpack_require__(68);
+	var invariant = __webpack_require__(42);
 	var hasOwnProperty = {}.hasOwnProperty;
 
 	function shallowCopy(x) {
@@ -2432,10 +2998,10 @@
 
 	module.exports = update;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 29 */
+/* 30 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -2452,12 +3018,12 @@
 
 	'use strict';
 
-	var DOMProperty = __webpack_require__(66);
-	var ReactDefaultPerfAnalysis = __webpack_require__(67);
-	var ReactMount = __webpack_require__(54);
-	var ReactPerf = __webpack_require__(35);
+	var DOMProperty = __webpack_require__(69);
+	var ReactDefaultPerfAnalysis = __webpack_require__(70);
+	var ReactMount = __webpack_require__(55);
+	var ReactPerf = __webpack_require__(38);
 
-	var performanceNow = __webpack_require__(68);
+	var performanceNow = __webpack_require__(71);
 
 	function roundFloat(val) {
 	  return Math.floor(val * 100) / 100;
@@ -2705,7 +3271,7 @@
 
 
 /***/ },
-/* 30 */
+/* 31 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -2721,22 +3287,22 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
-	var EventPluginHub = __webpack_require__(70);
-	var EventPropagators = __webpack_require__(71);
-	var React = __webpack_require__(21);
-	var ReactElement = __webpack_require__(48);
-	var ReactEmptyComponent = __webpack_require__(72);
-	var ReactBrowserEventEmitter = __webpack_require__(73);
-	var ReactCompositeComponent = __webpack_require__(74);
-	var ReactInstanceHandles = __webpack_require__(53);
-	var ReactInstanceMap = __webpack_require__(75);
-	var ReactMount = __webpack_require__(54);
-	var ReactUpdates = __webpack_require__(19);
-	var SyntheticEvent = __webpack_require__(76);
+	var EventConstants = __webpack_require__(72);
+	var EventPluginHub = __webpack_require__(73);
+	var EventPropagators = __webpack_require__(74);
+	var React = __webpack_require__(22);
+	var ReactElement = __webpack_require__(49);
+	var ReactEmptyComponent = __webpack_require__(75);
+	var ReactBrowserEventEmitter = __webpack_require__(76);
+	var ReactCompositeComponent = __webpack_require__(77);
+	var ReactInstanceHandles = __webpack_require__(54);
+	var ReactInstanceMap = __webpack_require__(78);
+	var ReactMount = __webpack_require__(55);
+	var ReactUpdates = __webpack_require__(20);
+	var SyntheticEvent = __webpack_require__(79);
 
-	var assign = __webpack_require__(38);
-	var emptyObject = __webpack_require__(77);
+	var assign = __webpack_require__(41);
+	var emptyObject = __webpack_require__(80);
 
 	var topLevelTypes = EventConstants.topLevelTypes;
 
@@ -3223,7 +3789,70 @@
 
 
 /***/ },
-/* 31 */
+/* 32 */
+/***/ function(module, exports, __webpack_require__) {
+
+	var __WEBPACK_AMD_DEFINE_ARRAY__, __WEBPACK_AMD_DEFINE_RESULT__;/**
+	 *  * The main UI component.
+	 *   *
+	 *    * @module view/ChannelListItem
+	 *     */
+	!(__WEBPACK_AMD_DEFINE_ARRAY__ = [
+	  __webpack_require__(7)
+	], __WEBPACK_AMD_DEFINE_RESULT__ = function(
+	  React
+	){
+	  var ChannelListItem;
+	  ChannelListItem = React.createClass({displayName: "ChannelListItem",
+	    render: function(){ 
+	      var classes = "nowtalk-admin__channellist-item ";
+	      if(this.props.active) classes += "nowtalk-admin__channellist-item-active";
+
+	      return(
+	        React.createElement("li", {className: classes}, 
+	          React.createElement("div", {className: "nowtalk-admin__channellist-item-name"}, this.props.name), 
+	          React.createElement("div", {className: "nowtalk-admin__channellist-item-counters"}, 
+	            React.createElement("span", {className: "nowtalk-admin__channellist-item-messagecount"}, 
+	              React.createElement("i", {className: "fa fa-comment"}), " ", this.props.messageCount
+	            ), 
+	            React.createElement("span", {className: "nowtalk-admin__channellist-item-usercount"}, 
+	              React.createElement("i", {className: "fa fa-user"}), "  ", this.props.userCount
+	            )
+	          )
+	        )
+	      );
+	    }
+	  });
+
+	  return ChannelListItem;
+	}.apply(exports, __WEBPACK_AMD_DEFINE_ARRAY__), __WEBPACK_AMD_DEFINE_RESULT__ !== undefined && (module.exports = __WEBPACK_AMD_DEFINE_RESULT__));
+
+
+/***/ },
+/* 33 */
+/***/ function(module, exports, __webpack_require__) {
+
+	var __WEBPACK_AMD_DEFINE_ARRAY__, __WEBPACK_AMD_DEFINE_RESULT__;!(__WEBPACK_AMD_DEFINE_ARRAY__ = [
+	  __webpack_require__(7)
+	], __WEBPACK_AMD_DEFINE_RESULT__ = function(
+	  React
+	){
+	  var NowtalkPreview;
+	  NowtalkPreview = React.createClass({displayName: "NowtalkPreview",
+	    render: function(){
+	      return (
+	        React.createElement("div", {className: "nowtalk-admin__nowtalk-preview"}, 
+	          "Nowtalk window"
+	        )
+	      );
+	    }
+	  });
+
+	  return NowtalkPreview;
+	}.apply(exports, __WEBPACK_AMD_DEFINE_ARRAY__), __WEBPACK_AMD_DEFINE_RESULT__ !== undefined && (module.exports = __WEBPACK_AMD_DEFINE_RESULT__));
+
+/***/ },
+/* 34 */
 /***/ function(module, exports, __webpack_require__) {
 
 	// shim for using process in browser
@@ -3319,7 +3948,7 @@
 
 
 /***/ },
-/* 32 */
+/* 35 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -3335,10 +3964,10 @@
 
 	'use strict';
 
-	var PooledClass = __webpack_require__(33);
+	var PooledClass = __webpack_require__(36);
 
-	var assign = __webpack_require__(38);
-	var invariant = __webpack_require__(39);
+	var assign = __webpack_require__(41);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * A specialized pseudo-event module to help keep track of components waiting to
@@ -3419,10 +4048,10 @@
 
 	module.exports = CallbackQueue;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 33 */
+/* 36 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -3438,7 +4067,7 @@
 
 	'use strict';
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Static poolers. Several custom versions for each potential number of
@@ -3538,10 +4167,10 @@
 
 	module.exports = PooledClass;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 34 */
+/* 37 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -3579,7 +4208,7 @@
 
 
 /***/ },
-/* 35 */
+/* 38 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -3683,10 +4312,10 @@
 
 	module.exports = ReactPerf;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 36 */
+/* 39 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -3702,8 +4331,8 @@
 
 	'use strict';
 
-	var ReactRef = __webpack_require__(78);
-	var ReactElementValidator = __webpack_require__(49);
+	var ReactRef = __webpack_require__(81);
+	var ReactElementValidator = __webpack_require__(50);
 
 	/**
 	 * Helper to call ReactRef.attachRefs with this composite component, split out
@@ -3810,10 +4439,10 @@
 
 	module.exports = ReactReconciler;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 37 */
+/* 40 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -3829,7 +4458,7 @@
 
 	'use strict';
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * `Transaction` creates a black box that is able to wrap any method such that
@@ -4054,10 +4683,10 @@
 
 	module.exports = Transaction;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 38 */
+/* 41 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -4110,7 +4739,7 @@
 
 
 /***/ },
-/* 39 */
+/* 42 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -4167,10 +4796,10 @@
 
 	module.exports = invariant;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 40 */
+/* 43 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -4186,7 +4815,7 @@
 
 	"use strict";
 
-	var emptyFunction = __webpack_require__(63);
+	var emptyFunction = __webpack_require__(66);
 
 	/**
 	 * Similar to invariant but only logs a warning if the condition is not met.
@@ -4233,197 +4862,10 @@
 
 	module.exports = warning;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 41 */
-/***/ function(module, exports, __webpack_require__) {
-
-	/**
-	 * Copyright 2013-2015, Facebook, Inc.
-	 * All rights reserved.
-	 *
-	 * This source code is licensed under the BSD-style license found in the
-	 * LICENSE file in the root directory of this source tree. An additional grant
-	 * of patent rights can be found in the PATENTS file in the same directory.
-	 *
-	 * @providesModule ReactLink
-	 * @typechecks static-only
-	 */
-
-	'use strict';
-
-	/**
-	 * ReactLink encapsulates a common pattern in which a component wants to modify
-	 * a prop received from its parent. ReactLink allows the parent to pass down a
-	 * value coupled with a callback that, when invoked, expresses an intent to
-	 * modify that value. For example:
-	 *
-	 * React.createClass({
-	 *   getInitialState: function() {
-	 *     return {value: ''};
-	 *   },
-	 *   render: function() {
-	 *     var valueLink = new ReactLink(this.state.value, this._handleValueChange);
-	 *     return <input valueLink={valueLink} />;
-	 *   },
-	 *   this._handleValueChange: function(newValue) {
-	 *     this.setState({value: newValue});
-	 *   }
-	 * });
-	 *
-	 * We have provided some sugary mixins to make the creation and
-	 * consumption of ReactLink easier; see LinkedValueUtils and LinkedStateMixin.
-	 */
-
-	var React = __webpack_require__(21);
-
-	/**
-	 * @param {*} value current value of the link
-	 * @param {function} requestChange callback to request a change
-	 */
-	function ReactLink(value, requestChange) {
-	  this.value = value;
-	  this.requestChange = requestChange;
-	}
-
-	/**
-	 * Creates a PropType that enforces the ReactLink API and optionally checks the
-	 * type of the value being passed inside the link. Example:
-	 *
-	 * MyComponent.propTypes = {
-	 *   tabIndexLink: ReactLink.PropTypes.link(React.PropTypes.number)
-	 * }
-	 */
-	function createLinkTypeChecker(linkType) {
-	  var shapes = {
-	    value: typeof linkType === 'undefined' ?
-	      React.PropTypes.any.isRequired :
-	      linkType.isRequired,
-	    requestChange: React.PropTypes.func.isRequired
-	  };
-	  return React.PropTypes.shape(shapes);
-	}
-
-	ReactLink.PropTypes = {
-	  link: createLinkTypeChecker
-	};
-
-	module.exports = ReactLink;
-
-
-/***/ },
-/* 42 */
-/***/ function(module, exports, __webpack_require__) {
-
-	/**
-	 * Copyright 2013-2015, Facebook, Inc.
-	 * All rights reserved.
-	 *
-	 * This source code is licensed under the BSD-style license found in the
-	 * LICENSE file in the root directory of this source tree. An additional grant
-	 * of patent rights can be found in the PATENTS file in the same directory.
-	 *
-	 * @providesModule ReactStateSetters
-	 */
-
-	'use strict';
-
-	var ReactStateSetters = {
-	  /**
-	   * Returns a function that calls the provided function, and uses the result
-	   * of that to set the component's state.
-	   *
-	   * @param {ReactCompositeComponent} component
-	   * @param {function} funcReturningState Returned callback uses this to
-	   *                                      determine how to update state.
-	   * @return {function} callback that when invoked uses funcReturningState to
-	   *                    determined the object literal to setState.
-	   */
-	  createStateSetter: function(component, funcReturningState) {
-	    return function(a, b, c, d, e, f) {
-	      var partialState = funcReturningState.call(component, a, b, c, d, e, f);
-	      if (partialState) {
-	        component.setState(partialState);
-	      }
-	    };
-	  },
-
-	  /**
-	   * Returns a single-argument callback that can be used to update a single
-	   * key in the component's state.
-	   *
-	   * Note: this is memoized function, which makes it inexpensive to call.
-	   *
-	   * @param {ReactCompositeComponent} component
-	   * @param {string} key The key in the state that you should update.
-	   * @return {function} callback of 1 argument which calls setState() with
-	   *                    the provided keyName and callback argument.
-	   */
-	  createStateKeySetter: function(component, key) {
-	    // Memoize the setters.
-	    var cache = component.__keySetters || (component.__keySetters = {});
-	    return cache[key] || (cache[key] = createStateKeySetter(component, key));
-	  }
-	};
-
-	function createStateKeySetter(component, key) {
-	  // Partial state is allocated outside of the function closure so it can be
-	  // reused with every call, avoiding memory allocation when this function
-	  // is called.
-	  var partialState = {};
-	  return function stateKeySetter(value) {
-	    partialState[key] = value;
-	    component.setState(partialState);
-	  };
-	}
-
-	ReactStateSetters.Mixin = {
-	  /**
-	   * Returns a function that calls the provided function, and uses the result
-	   * of that to set the component's state.
-	   *
-	   * For example, these statements are equivalent:
-	   *
-	   *   this.setState({x: 1});
-	   *   this.createStateSetter(function(xValue) {
-	   *     return {x: xValue};
-	   *   })(1);
-	   *
-	   * @param {function} funcReturningState Returned callback uses this to
-	   *                                      determine how to update state.
-	   * @return {function} callback that when invoked uses funcReturningState to
-	   *                    determined the object literal to setState.
-	   */
-	  createStateSetter: function(funcReturningState) {
-	    return ReactStateSetters.createStateSetter(this, funcReturningState);
-	  },
-
-	  /**
-	   * Returns a single-argument callback that can be used to update a single
-	   * key in the component's state.
-	   *
-	   * For example, these statements are equivalent:
-	   *
-	   *   this.setState({x: 1});
-	   *   this.createStateKeySetter('x')(1);
-	   *
-	   * Note: this is memoized function, which makes it inexpensive to call.
-	   *
-	   * @param {string} key The key in the state that you should update.
-	   * @return {function} callback of 1 argument which calls setState() with
-	   *                    the provided keyName and callback argument.
-	   */
-	  createStateKeySetter: function(key) {
-	    return ReactStateSetters.createStateKeySetter(this, key);
-	  }
-	};
-
-	module.exports = ReactStateSetters;
-
-
-/***/ },
-/* 43 */
+/* 44 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -4439,9 +4881,9 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
+	var EventConstants = __webpack_require__(72);
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Injected dependencies:
@@ -4644,10 +5086,10 @@
 
 	module.exports = EventPluginUtils;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 44 */
+/* 45 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -4663,11 +5105,11 @@
 
 	'use strict';
 
-	var PooledClass = __webpack_require__(33);
-	var ReactFragment = __webpack_require__(24);
+	var PooledClass = __webpack_require__(36);
+	var ReactFragment = __webpack_require__(25);
 
-	var traverseAllChildren = __webpack_require__(79);
-	var warning = __webpack_require__(40);
+	var traverseAllChildren = __webpack_require__(82);
+	var warning = __webpack_require__(43);
 
 	var twoArgumentPooler = PooledClass.twoArgumentPooler;
 	var threeArgumentPooler = PooledClass.threeArgumentPooler;
@@ -4800,10 +5242,10 @@
 
 	module.exports = ReactChildren;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 45 */
+/* 46 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -4819,10 +5261,10 @@
 
 	'use strict';
 
-	var ReactUpdateQueue = __webpack_require__(80);
+	var ReactUpdateQueue = __webpack_require__(83);
 
-	var invariant = __webpack_require__(39);
-	var warning = __webpack_require__(40);
+	var invariant = __webpack_require__(42);
+	var warning = __webpack_require__(43);
 
 	/**
 	 * Base class helpers for the updating state of a component.
@@ -4957,10 +5399,10 @@
 
 	module.exports = ReactComponent;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 46 */
+/* 47 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -4976,21 +5418,21 @@
 
 	'use strict';
 
-	var ReactComponent = __webpack_require__(45);
-	var ReactCurrentOwner = __webpack_require__(34);
-	var ReactElement = __webpack_require__(48);
-	var ReactErrorUtils = __webpack_require__(82);
-	var ReactInstanceMap = __webpack_require__(75);
-	var ReactLifeCycle = __webpack_require__(83);
-	var ReactPropTypeLocations = __webpack_require__(84);
-	var ReactPropTypeLocationNames = __webpack_require__(81);
-	var ReactUpdateQueue = __webpack_require__(80);
+	var ReactComponent = __webpack_require__(46);
+	var ReactCurrentOwner = __webpack_require__(37);
+	var ReactElement = __webpack_require__(49);
+	var ReactErrorUtils = __webpack_require__(85);
+	var ReactInstanceMap = __webpack_require__(78);
+	var ReactLifeCycle = __webpack_require__(86);
+	var ReactPropTypeLocations = __webpack_require__(87);
+	var ReactPropTypeLocationNames = __webpack_require__(84);
+	var ReactUpdateQueue = __webpack_require__(83);
 
-	var assign = __webpack_require__(38);
-	var invariant = __webpack_require__(39);
-	var keyMirror = __webpack_require__(85);
-	var keyOf = __webpack_require__(65);
-	var warning = __webpack_require__(40);
+	var assign = __webpack_require__(41);
+	var invariant = __webpack_require__(42);
+	var keyMirror = __webpack_require__(88);
+	var keyOf = __webpack_require__(68);
+	var warning = __webpack_require__(43);
 
 	var MIXINS_KEY = keyOf({mixins: null});
 
@@ -5906,10 +6348,10 @@
 
 	module.exports = ReactClass;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 47 */
+/* 48 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -5925,9 +6367,9 @@
 
 	'use strict';
 
-	var assign = __webpack_require__(38);
-	var emptyObject = __webpack_require__(77);
-	var warning = __webpack_require__(40);
+	var assign = __webpack_require__(41);
+	var emptyObject = __webpack_require__(80);
+	var warning = __webpack_require__(43);
 
 	var didWarn = false;
 
@@ -5987,10 +6429,10 @@
 
 	module.exports = ReactContext;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 48 */
+/* 49 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -6006,11 +6448,11 @@
 
 	'use strict';
 
-	var ReactContext = __webpack_require__(47);
-	var ReactCurrentOwner = __webpack_require__(34);
+	var ReactContext = __webpack_require__(48);
+	var ReactCurrentOwner = __webpack_require__(37);
 
-	var assign = __webpack_require__(38);
-	var warning = __webpack_require__(40);
+	var assign = __webpack_require__(41);
+	var warning = __webpack_require__(43);
 
 	var RESERVED_PROPS = {
 	  key: true,
@@ -6298,10 +6740,10 @@
 
 	module.exports = ReactElement;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 49 */
+/* 50 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -6324,16 +6766,16 @@
 
 	'use strict';
 
-	var ReactElement = __webpack_require__(48);
-	var ReactFragment = __webpack_require__(24);
-	var ReactPropTypeLocations = __webpack_require__(84);
-	var ReactPropTypeLocationNames = __webpack_require__(81);
-	var ReactCurrentOwner = __webpack_require__(34);
-	var ReactNativeComponent = __webpack_require__(86);
+	var ReactElement = __webpack_require__(49);
+	var ReactFragment = __webpack_require__(25);
+	var ReactPropTypeLocations = __webpack_require__(87);
+	var ReactPropTypeLocationNames = __webpack_require__(84);
+	var ReactCurrentOwner = __webpack_require__(37);
+	var ReactNativeComponent = __webpack_require__(89);
 
-	var getIteratorFn = __webpack_require__(87);
-	var invariant = __webpack_require__(39);
-	var warning = __webpack_require__(40);
+	var getIteratorFn = __webpack_require__(90);
+	var invariant = __webpack_require__(42);
+	var warning = __webpack_require__(43);
 
 	function getDeclarationErrorAddendum() {
 	  if (ReactCurrentOwner.current) {
@@ -6766,10 +7208,10 @@
 
 	module.exports = ReactElementValidator;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 50 */
+/* 51 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -6786,10 +7228,10 @@
 
 	'use strict';
 
-	var ReactElement = __webpack_require__(48);
-	var ReactElementValidator = __webpack_require__(49);
+	var ReactElement = __webpack_require__(49);
+	var ReactElementValidator = __webpack_require__(50);
 
-	var mapObject = __webpack_require__(88);
+	var mapObject = __webpack_require__(91);
 
 	/**
 	 * Create a factory that creates HTML tag elements.
@@ -6948,10 +7390,10 @@
 
 	module.exports = ReactDOM;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 51 */
+/* 52 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -6968,13 +7410,13 @@
 
 	'use strict';
 
-	var DOMPropertyOperations = __webpack_require__(89);
+	var DOMPropertyOperations = __webpack_require__(92);
 	var ReactComponentBrowserEnvironment =
-	  __webpack_require__(90);
-	var ReactDOMComponent = __webpack_require__(91);
+	  __webpack_require__(93);
+	var ReactDOMComponent = __webpack_require__(94);
 
-	var assign = __webpack_require__(38);
-	var escapeTextContentForBrowser = __webpack_require__(92);
+	var assign = __webpack_require__(41);
+	var escapeTextContentForBrowser = __webpack_require__(95);
 
 	/**
 	 * Text nodes violate a couple assumptions that React makes about components:
@@ -7072,7 +7514,7 @@
 
 
 /***/ },
-/* 52 */
+/* 53 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -7088,42 +7530,42 @@
 
 	'use strict';
 
-	var BeforeInputEventPlugin = __webpack_require__(93);
-	var ChangeEventPlugin = __webpack_require__(94);
-	var ClientReactRootIndex = __webpack_require__(1);
-	var DefaultEventPluginOrder = __webpack_require__(96);
-	var EnterLeaveEventPlugin = __webpack_require__(97);
-	var ExecutionEnvironment = __webpack_require__(59);
-	var HTMLDOMPropertyConfig = __webpack_require__(98);
-	var MobileSafariClickEventPlugin = __webpack_require__(99);
-	var ReactBrowserComponentMixin = __webpack_require__(100);
-	var ReactClass = __webpack_require__(46);
+	var BeforeInputEventPlugin = __webpack_require__(1);
+	var ChangeEventPlugin = __webpack_require__(97);
+	var ClientReactRootIndex = __webpack_require__(98);
+	var DefaultEventPluginOrder = __webpack_require__(99);
+	var EnterLeaveEventPlugin = __webpack_require__(100);
+	var ExecutionEnvironment = __webpack_require__(60);
+	var HTMLDOMPropertyConfig = __webpack_require__(101);
+	var MobileSafariClickEventPlugin = __webpack_require__(102);
+	var ReactBrowserComponentMixin = __webpack_require__(103);
+	var ReactClass = __webpack_require__(47);
 	var ReactComponentBrowserEnvironment =
-	  __webpack_require__(90);
-	var ReactDefaultBatchingStrategy = __webpack_require__(101);
-	var ReactDOMComponent = __webpack_require__(91);
-	var ReactDOMButton = __webpack_require__(102);
-	var ReactDOMForm = __webpack_require__(103);
-	var ReactDOMImg = __webpack_require__(104);
-	var ReactDOMIDOperations = __webpack_require__(105);
-	var ReactDOMIframe = __webpack_require__(106);
-	var ReactDOMInput = __webpack_require__(107);
-	var ReactDOMOption = __webpack_require__(108);
-	var ReactDOMSelect = __webpack_require__(109);
-	var ReactDOMTextarea = __webpack_require__(110);
-	var ReactDOMTextComponent = __webpack_require__(51);
-	var ReactElement = __webpack_require__(48);
-	var ReactEventListener = __webpack_require__(111);
-	var ReactInjection = __webpack_require__(112);
-	var ReactInstanceHandles = __webpack_require__(53);
-	var ReactMount = __webpack_require__(54);
-	var ReactReconcileTransaction = __webpack_require__(113);
-	var SelectEventPlugin = __webpack_require__(114);
-	var ServerReactRootIndex = __webpack_require__(115);
-	var SimpleEventPlugin = __webpack_require__(116);
-	var SVGDOMPropertyConfig = __webpack_require__(117);
+	  __webpack_require__(93);
+	var ReactDefaultBatchingStrategy = __webpack_require__(104);
+	var ReactDOMComponent = __webpack_require__(94);
+	var ReactDOMButton = __webpack_require__(105);
+	var ReactDOMForm = __webpack_require__(106);
+	var ReactDOMImg = __webpack_require__(107);
+	var ReactDOMIDOperations = __webpack_require__(108);
+	var ReactDOMIframe = __webpack_require__(109);
+	var ReactDOMInput = __webpack_require__(110);
+	var ReactDOMOption = __webpack_require__(111);
+	var ReactDOMSelect = __webpack_require__(112);
+	var ReactDOMTextarea = __webpack_require__(113);
+	var ReactDOMTextComponent = __webpack_require__(52);
+	var ReactElement = __webpack_require__(49);
+	var ReactEventListener = __webpack_require__(114);
+	var ReactInjection = __webpack_require__(115);
+	var ReactInstanceHandles = __webpack_require__(54);
+	var ReactMount = __webpack_require__(55);
+	var ReactReconcileTransaction = __webpack_require__(116);
+	var SelectEventPlugin = __webpack_require__(117);
+	var ServerReactRootIndex = __webpack_require__(118);
+	var SimpleEventPlugin = __webpack_require__(119);
+	var SVGDOMPropertyConfig = __webpack_require__(120);
 
-	var createFullPageComponent = __webpack_require__(118);
+	var createFullPageComponent = __webpack_require__(121);
 
 	function autoGenerateWrapperClass(type) {
 	  return ReactClass.createClass({
@@ -7221,7 +7663,7 @@
 	  if ("production" !== process.env.NODE_ENV) {
 	    var url = (ExecutionEnvironment.canUseDOM && window.location.href) || '';
 	    if ((/[?&]react_perf\b/).test(url)) {
-	      var ReactDefaultPerf = __webpack_require__(29);
+	      var ReactDefaultPerf = __webpack_require__(30);
 	      ReactDefaultPerf.start();
 	    }
 	  }
@@ -7231,10 +7673,10 @@
 	  inject: inject
 	};
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 53 */
+/* 54 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -7251,9 +7693,9 @@
 
 	'use strict';
 
-	var ReactRootIndex = __webpack_require__(119);
+	var ReactRootIndex = __webpack_require__(122);
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	var SEPARATOR = '.';
 	var SEPARATOR_LENGTH = SEPARATOR.length;
@@ -7570,10 +8012,10 @@
 
 	module.exports = ReactInstanceHandles;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 54 */
+/* 55 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -7589,28 +8031,28 @@
 
 	'use strict';
 
-	var DOMProperty = __webpack_require__(66);
-	var ReactBrowserEventEmitter = __webpack_require__(73);
-	var ReactCurrentOwner = __webpack_require__(34);
-	var ReactElement = __webpack_require__(48);
-	var ReactElementValidator = __webpack_require__(49);
-	var ReactEmptyComponent = __webpack_require__(72);
-	var ReactInstanceHandles = __webpack_require__(53);
-	var ReactInstanceMap = __webpack_require__(75);
-	var ReactMarkupChecksum = __webpack_require__(120);
-	var ReactPerf = __webpack_require__(35);
-	var ReactReconciler = __webpack_require__(36);
-	var ReactUpdateQueue = __webpack_require__(80);
-	var ReactUpdates = __webpack_require__(19);
+	var DOMProperty = __webpack_require__(69);
+	var ReactBrowserEventEmitter = __webpack_require__(76);
+	var ReactCurrentOwner = __webpack_require__(37);
+	var ReactElement = __webpack_require__(49);
+	var ReactElementValidator = __webpack_require__(50);
+	var ReactEmptyComponent = __webpack_require__(75);
+	var ReactInstanceHandles = __webpack_require__(54);
+	var ReactInstanceMap = __webpack_require__(78);
+	var ReactMarkupChecksum = __webpack_require__(123);
+	var ReactPerf = __webpack_require__(38);
+	var ReactReconciler = __webpack_require__(39);
+	var ReactUpdateQueue = __webpack_require__(83);
+	var ReactUpdates = __webpack_require__(20);
 
-	var emptyObject = __webpack_require__(77);
-	var containsNode = __webpack_require__(121);
-	var getReactRootElementInContainer = __webpack_require__(122);
-	var instantiateReactComponent = __webpack_require__(123);
-	var invariant = __webpack_require__(39);
-	var setInnerHTML = __webpack_require__(124);
-	var shouldUpdateReactComponent = __webpack_require__(125);
-	var warning = __webpack_require__(40);
+	var emptyObject = __webpack_require__(80);
+	var containsNode = __webpack_require__(124);
+	var getReactRootElementInContainer = __webpack_require__(125);
+	var instantiateReactComponent = __webpack_require__(126);
+	var invariant = __webpack_require__(42);
+	var setInnerHTML = __webpack_require__(127);
+	var shouldUpdateReactComponent = __webpack_require__(128);
+	var warning = __webpack_require__(43);
 
 	var SEPARATOR = ReactInstanceHandles.SEPARATOR;
 
@@ -8464,10 +8906,10 @@
 
 	module.exports = ReactMount;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 55 */
+/* 56 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -8483,11 +8925,11 @@
 
 	'use strict';
 
-	var ReactElement = __webpack_require__(48);
-	var ReactFragment = __webpack_require__(24);
-	var ReactPropTypeLocationNames = __webpack_require__(81);
+	var ReactElement = __webpack_require__(49);
+	var ReactFragment = __webpack_require__(25);
+	var ReactPropTypeLocationNames = __webpack_require__(84);
 
-	var emptyFunction = __webpack_require__(63);
+	var emptyFunction = __webpack_require__(66);
 
 	/**
 	 * Collection of methods that allow declaration and validation of props that are
@@ -8820,7 +9262,7 @@
 
 
 /***/ },
-/* 56 */
+/* 57 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -8836,15 +9278,15 @@
 	 */
 	'use strict';
 
-	var ReactElement = __webpack_require__(48);
-	var ReactInstanceHandles = __webpack_require__(53);
-	var ReactMarkupChecksum = __webpack_require__(120);
+	var ReactElement = __webpack_require__(49);
+	var ReactInstanceHandles = __webpack_require__(54);
+	var ReactMarkupChecksum = __webpack_require__(123);
 	var ReactServerRenderingTransaction =
-	  __webpack_require__(126);
+	  __webpack_require__(129);
 
-	var emptyObject = __webpack_require__(77);
-	var instantiateReactComponent = __webpack_require__(123);
-	var invariant = __webpack_require__(39);
+	var emptyObject = __webpack_require__(80);
+	var instantiateReactComponent = __webpack_require__(126);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * @param {ReactElement} element
@@ -8902,10 +9344,10 @@
 	  renderToStaticMarkup: renderToStaticMarkup
 	};
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 57 */
+/* 58 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -8922,13 +9364,13 @@
 
 	'use strict';
 
-	var ReactCurrentOwner = __webpack_require__(34);
-	var ReactInstanceMap = __webpack_require__(75);
-	var ReactMount = __webpack_require__(54);
+	var ReactCurrentOwner = __webpack_require__(37);
+	var ReactInstanceMap = __webpack_require__(78);
+	var ReactMount = __webpack_require__(55);
 
-	var invariant = __webpack_require__(39);
-	var isNode = __webpack_require__(127);
-	var warning = __webpack_require__(40);
+	var invariant = __webpack_require__(42);
+	var isNode = __webpack_require__(130);
+	var warning = __webpack_require__(43);
 
 	/**
 	 * Returns the DOM node rendered by this element.
@@ -8978,10 +9420,10 @@
 
 	module.exports = findDOMNode;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 58 */
+/* 59 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -8996,9 +9438,9 @@
 	 */
 	'use strict';
 
-	var ReactElement = __webpack_require__(48);
+	var ReactElement = __webpack_require__(49);
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Returns the first child in a collection of children and verifies that there
@@ -9021,10 +9463,10 @@
 
 	module.exports = onlyChild;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 59 */
+/* 60 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -9072,7 +9514,194 @@
 
 
 /***/ },
-/* 60 */
+/* 61 */
+/***/ function(module, exports, __webpack_require__) {
+
+	/**
+	 * Copyright 2013-2015, Facebook, Inc.
+	 * All rights reserved.
+	 *
+	 * This source code is licensed under the BSD-style license found in the
+	 * LICENSE file in the root directory of this source tree. An additional grant
+	 * of patent rights can be found in the PATENTS file in the same directory.
+	 *
+	 * @providesModule ReactLink
+	 * @typechecks static-only
+	 */
+
+	'use strict';
+
+	/**
+	 * ReactLink encapsulates a common pattern in which a component wants to modify
+	 * a prop received from its parent. ReactLink allows the parent to pass down a
+	 * value coupled with a callback that, when invoked, expresses an intent to
+	 * modify that value. For example:
+	 *
+	 * React.createClass({
+	 *   getInitialState: function() {
+	 *     return {value: ''};
+	 *   },
+	 *   render: function() {
+	 *     var valueLink = new ReactLink(this.state.value, this._handleValueChange);
+	 *     return <input valueLink={valueLink} />;
+	 *   },
+	 *   this._handleValueChange: function(newValue) {
+	 *     this.setState({value: newValue});
+	 *   }
+	 * });
+	 *
+	 * We have provided some sugary mixins to make the creation and
+	 * consumption of ReactLink easier; see LinkedValueUtils and LinkedStateMixin.
+	 */
+
+	var React = __webpack_require__(22);
+
+	/**
+	 * @param {*} value current value of the link
+	 * @param {function} requestChange callback to request a change
+	 */
+	function ReactLink(value, requestChange) {
+	  this.value = value;
+	  this.requestChange = requestChange;
+	}
+
+	/**
+	 * Creates a PropType that enforces the ReactLink API and optionally checks the
+	 * type of the value being passed inside the link. Example:
+	 *
+	 * MyComponent.propTypes = {
+	 *   tabIndexLink: ReactLink.PropTypes.link(React.PropTypes.number)
+	 * }
+	 */
+	function createLinkTypeChecker(linkType) {
+	  var shapes = {
+	    value: typeof linkType === 'undefined' ?
+	      React.PropTypes.any.isRequired :
+	      linkType.isRequired,
+	    requestChange: React.PropTypes.func.isRequired
+	  };
+	  return React.PropTypes.shape(shapes);
+	}
+
+	ReactLink.PropTypes = {
+	  link: createLinkTypeChecker
+	};
+
+	module.exports = ReactLink;
+
+
+/***/ },
+/* 62 */
+/***/ function(module, exports, __webpack_require__) {
+
+	/**
+	 * Copyright 2013-2015, Facebook, Inc.
+	 * All rights reserved.
+	 *
+	 * This source code is licensed under the BSD-style license found in the
+	 * LICENSE file in the root directory of this source tree. An additional grant
+	 * of patent rights can be found in the PATENTS file in the same directory.
+	 *
+	 * @providesModule ReactStateSetters
+	 */
+
+	'use strict';
+
+	var ReactStateSetters = {
+	  /**
+	   * Returns a function that calls the provided function, and uses the result
+	   * of that to set the component's state.
+	   *
+	   * @param {ReactCompositeComponent} component
+	   * @param {function} funcReturningState Returned callback uses this to
+	   *                                      determine how to update state.
+	   * @return {function} callback that when invoked uses funcReturningState to
+	   *                    determined the object literal to setState.
+	   */
+	  createStateSetter: function(component, funcReturningState) {
+	    return function(a, b, c, d, e, f) {
+	      var partialState = funcReturningState.call(component, a, b, c, d, e, f);
+	      if (partialState) {
+	        component.setState(partialState);
+	      }
+	    };
+	  },
+
+	  /**
+	   * Returns a single-argument callback that can be used to update a single
+	   * key in the component's state.
+	   *
+	   * Note: this is memoized function, which makes it inexpensive to call.
+	   *
+	   * @param {ReactCompositeComponent} component
+	   * @param {string} key The key in the state that you should update.
+	   * @return {function} callback of 1 argument which calls setState() with
+	   *                    the provided keyName and callback argument.
+	   */
+	  createStateKeySetter: function(component, key) {
+	    // Memoize the setters.
+	    var cache = component.__keySetters || (component.__keySetters = {});
+	    return cache[key] || (cache[key] = createStateKeySetter(component, key));
+	  }
+	};
+
+	function createStateKeySetter(component, key) {
+	  // Partial state is allocated outside of the function closure so it can be
+	  // reused with every call, avoiding memory allocation when this function
+	  // is called.
+	  var partialState = {};
+	  return function stateKeySetter(value) {
+	    partialState[key] = value;
+	    component.setState(partialState);
+	  };
+	}
+
+	ReactStateSetters.Mixin = {
+	  /**
+	   * Returns a function that calls the provided function, and uses the result
+	   * of that to set the component's state.
+	   *
+	   * For example, these statements are equivalent:
+	   *
+	   *   this.setState({x: 1});
+	   *   this.createStateSetter(function(xValue) {
+	   *     return {x: xValue};
+	   *   })(1);
+	   *
+	   * @param {function} funcReturningState Returned callback uses this to
+	   *                                      determine how to update state.
+	   * @return {function} callback that when invoked uses funcReturningState to
+	   *                    determined the object literal to setState.
+	   */
+	  createStateSetter: function(funcReturningState) {
+	    return ReactStateSetters.createStateSetter(this, funcReturningState);
+	  },
+
+	  /**
+	   * Returns a single-argument callback that can be used to update a single
+	   * key in the component's state.
+	   *
+	   * For example, these statements are equivalent:
+	   *
+	   *   this.setState({x: 1});
+	   *   this.createStateKeySetter('x')(1);
+	   *
+	   * Note: this is memoized function, which makes it inexpensive to call.
+	   *
+	   * @param {string} key The key in the state that you should update.
+	   * @return {function} callback of 1 argument which calls setState() with
+	   *                    the provided keyName and callback argument.
+	   */
+	  createStateKeySetter: function(key) {
+	    return ReactStateSetters.createStateKeySetter(this, key);
+	  }
+	};
+
+	module.exports = ReactStateSetters;
+
+
+/***/ },
+/* 63 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -9120,7 +9749,7 @@
 
 
 /***/ },
-/* 61 */
+/* 64 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -9137,13 +9766,13 @@
 
 	'use strict';
 
-	var React = __webpack_require__(21);
+	var React = __webpack_require__(22);
 
-	var CSSCore = __webpack_require__(128);
-	var ReactTransitionEvents = __webpack_require__(129);
+	var CSSCore = __webpack_require__(131);
+	var ReactTransitionEvents = __webpack_require__(132);
 
-	var onlyChild = __webpack_require__(58);
-	var warning = __webpack_require__(40);
+	var onlyChild = __webpack_require__(59);
+	var warning = __webpack_require__(43);
 
 	// We don't remove the element from the DOM until we receive an animationend or
 	// transitionend event. If the user screws up and forgets to add an animation
@@ -9268,10 +9897,10 @@
 
 	module.exports = ReactCSSTransitionGroupChild;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 62 */
+/* 65 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -9288,8 +9917,8 @@
 
 	'use strict';
 
-	var ReactChildren = __webpack_require__(44);
-	var ReactFragment = __webpack_require__(24);
+	var ReactChildren = __webpack_require__(45);
+	var ReactFragment = __webpack_require__(25);
 
 	var ReactTransitionChildMapping = {
 	  /**
@@ -9380,7 +10009,7 @@
 
 
 /***/ },
-/* 63 */
+/* 66 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -9418,7 +10047,7 @@
 
 
 /***/ },
-/* 64 */
+/* 67 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -9434,9 +10063,9 @@
 
 	'use strict';
 
-	var assign = __webpack_require__(38);
-	var emptyFunction = __webpack_require__(63);
-	var joinClasses = __webpack_require__(130);
+	var assign = __webpack_require__(41);
+	var emptyFunction = __webpack_require__(66);
+	var joinClasses = __webpack_require__(133);
 
 	/**
 	 * Creates a transfer strategy that will merge prop values using the supplied
@@ -9532,7 +10161,7 @@
 
 
 /***/ },
-/* 65 */
+/* 68 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -9572,7 +10201,7 @@
 
 
 /***/ },
-/* 66 */
+/* 69 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -9591,7 +10220,7 @@
 
 	'use strict';
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	function checkMask(value, bitmask) {
 	  return (value & bitmask) === bitmask;
@@ -9871,10 +10500,10 @@
 
 	module.exports = DOMProperty;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 67 */
+/* 70 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -9888,7 +10517,7 @@
 	 * @providesModule ReactDefaultPerfAnalysis
 	 */
 
-	var assign = __webpack_require__(38);
+	var assign = __webpack_require__(41);
 
 	// Don't try to save users less than 1.2ms (a number I made up)
 	var DONT_CARE_THRESHOLD = 1.2;
@@ -10084,7 +10713,7 @@
 
 
 /***/ },
-/* 68 */
+/* 71 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -10099,7 +10728,7 @@
 	 * @typechecks
 	 */
 
-	var performance = __webpack_require__(131);
+	var performance = __webpack_require__(134);
 
 	/**
 	 * Detect if we can use `window.performance.now()` and gracefully fallback to
@@ -10116,7 +10745,7 @@
 
 
 /***/ },
-/* 69 */
+/* 72 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -10132,7 +10761,7 @@
 
 	'use strict';
 
-	var keyMirror = __webpack_require__(85);
+	var keyMirror = __webpack_require__(88);
 
 	var PropagationPhases = keyMirror({bubbled: null, captured: null});
 
@@ -10192,7 +10821,7 @@
 
 
 /***/ },
-/* 70 */
+/* 73 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -10208,12 +10837,12 @@
 
 	'use strict';
 
-	var EventPluginRegistry = __webpack_require__(132);
-	var EventPluginUtils = __webpack_require__(43);
+	var EventPluginRegistry = __webpack_require__(135);
+	var EventPluginUtils = __webpack_require__(44);
 
-	var accumulateInto = __webpack_require__(133);
-	var forEachAccumulated = __webpack_require__(134);
-	var invariant = __webpack_require__(39);
+	var accumulateInto = __webpack_require__(136);
+	var forEachAccumulated = __webpack_require__(137);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Internal store for event listeners
@@ -10470,10 +11099,10 @@
 
 	module.exports = EventPluginHub;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 71 */
+/* 74 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -10489,11 +11118,11 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
-	var EventPluginHub = __webpack_require__(70);
+	var EventConstants = __webpack_require__(72);
+	var EventPluginHub = __webpack_require__(73);
 
-	var accumulateInto = __webpack_require__(133);
-	var forEachAccumulated = __webpack_require__(134);
+	var accumulateInto = __webpack_require__(136);
+	var forEachAccumulated = __webpack_require__(137);
 
 	var PropagationPhases = EventConstants.PropagationPhases;
 	var getListener = EventPluginHub.getListener;
@@ -10615,10 +11244,10 @@
 
 	module.exports = EventPropagators;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 72 */
+/* 75 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -10634,10 +11263,10 @@
 
 	'use strict';
 
-	var ReactElement = __webpack_require__(48);
-	var ReactInstanceMap = __webpack_require__(75);
+	var ReactElement = __webpack_require__(49);
+	var ReactInstanceMap = __webpack_require__(78);
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	var component;
 	// This registry keeps track of the React IDs of the components that rendered to
@@ -10713,10 +11342,10 @@
 
 	module.exports = ReactEmptyComponent;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 73 */
+/* 76 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -10733,14 +11362,14 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
-	var EventPluginHub = __webpack_require__(70);
-	var EventPluginRegistry = __webpack_require__(132);
-	var ReactEventEmitterMixin = __webpack_require__(135);
-	var ViewportMetrics = __webpack_require__(136);
+	var EventConstants = __webpack_require__(72);
+	var EventPluginHub = __webpack_require__(73);
+	var EventPluginRegistry = __webpack_require__(135);
+	var ReactEventEmitterMixin = __webpack_require__(138);
+	var ViewportMetrics = __webpack_require__(139);
 
-	var assign = __webpack_require__(38);
-	var isEventSupported = __webpack_require__(137);
+	var assign = __webpack_require__(41);
+	var isEventSupported = __webpack_require__(140);
 
 	/**
 	 * Summary of `ReactBrowserEventEmitter` event handling:
@@ -11073,7 +11702,7 @@
 
 
 /***/ },
-/* 74 */
+/* 77 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -11089,25 +11718,25 @@
 
 	'use strict';
 
-	var ReactComponentEnvironment = __webpack_require__(138);
-	var ReactContext = __webpack_require__(47);
-	var ReactCurrentOwner = __webpack_require__(34);
-	var ReactElement = __webpack_require__(48);
-	var ReactElementValidator = __webpack_require__(49);
-	var ReactInstanceMap = __webpack_require__(75);
-	var ReactLifeCycle = __webpack_require__(83);
-	var ReactNativeComponent = __webpack_require__(86);
-	var ReactPerf = __webpack_require__(35);
-	var ReactPropTypeLocations = __webpack_require__(84);
-	var ReactPropTypeLocationNames = __webpack_require__(81);
-	var ReactReconciler = __webpack_require__(36);
-	var ReactUpdates = __webpack_require__(19);
+	var ReactComponentEnvironment = __webpack_require__(141);
+	var ReactContext = __webpack_require__(48);
+	var ReactCurrentOwner = __webpack_require__(37);
+	var ReactElement = __webpack_require__(49);
+	var ReactElementValidator = __webpack_require__(50);
+	var ReactInstanceMap = __webpack_require__(78);
+	var ReactLifeCycle = __webpack_require__(86);
+	var ReactNativeComponent = __webpack_require__(89);
+	var ReactPerf = __webpack_require__(38);
+	var ReactPropTypeLocations = __webpack_require__(87);
+	var ReactPropTypeLocationNames = __webpack_require__(84);
+	var ReactReconciler = __webpack_require__(39);
+	var ReactUpdates = __webpack_require__(20);
 
-	var assign = __webpack_require__(38);
-	var emptyObject = __webpack_require__(77);
-	var invariant = __webpack_require__(39);
-	var shouldUpdateReactComponent = __webpack_require__(125);
-	var warning = __webpack_require__(40);
+	var assign = __webpack_require__(41);
+	var emptyObject = __webpack_require__(80);
+	var invariant = __webpack_require__(42);
+	var shouldUpdateReactComponent = __webpack_require__(128);
+	var warning = __webpack_require__(43);
 
 	function getDeclarationErrorAddendum(component) {
 	  var owner = component._currentElement._owner || null;
@@ -11986,10 +12615,10 @@
 
 	module.exports = ReactCompositeComponent;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 75 */
+/* 78 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -12042,7 +12671,7 @@
 
 
 /***/ },
-/* 76 */
+/* 79 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -12059,11 +12688,11 @@
 
 	'use strict';
 
-	var PooledClass = __webpack_require__(33);
+	var PooledClass = __webpack_require__(36);
 
-	var assign = __webpack_require__(38);
-	var emptyFunction = __webpack_require__(63);
-	var getEventTarget = __webpack_require__(139);
+	var assign = __webpack_require__(41);
+	var emptyFunction = __webpack_require__(66);
+	var getEventTarget = __webpack_require__(142);
 
 	/**
 	 * @interface Event
@@ -12212,7 +12841,7 @@
 
 
 /***/ },
-/* 77 */
+/* 80 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -12236,10 +12865,10 @@
 
 	module.exports = emptyObject;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 78 */
+/* 81 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -12255,7 +12884,7 @@
 
 	'use strict';
 
-	var ReactOwner = __webpack_require__(140);
+	var ReactOwner = __webpack_require__(143);
 
 	var ReactRef = {};
 
@@ -12314,7 +12943,7 @@
 
 
 /***/ },
-/* 79 */
+/* 82 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -12330,13 +12959,13 @@
 
 	'use strict';
 
-	var ReactElement = __webpack_require__(48);
-	var ReactFragment = __webpack_require__(24);
-	var ReactInstanceHandles = __webpack_require__(53);
+	var ReactElement = __webpack_require__(49);
+	var ReactFragment = __webpack_require__(25);
+	var ReactInstanceHandles = __webpack_require__(54);
 
-	var getIteratorFn = __webpack_require__(87);
-	var invariant = __webpack_require__(39);
-	var warning = __webpack_require__(40);
+	var getIteratorFn = __webpack_require__(90);
+	var invariant = __webpack_require__(42);
+	var warning = __webpack_require__(43);
 
 	var SEPARATOR = ReactInstanceHandles.SEPARATOR;
 	var SUBSEPARATOR = ':';
@@ -12567,10 +13196,10 @@
 
 	module.exports = traverseAllChildren;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 80 */
+/* 83 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -12586,15 +13215,15 @@
 
 	'use strict';
 
-	var ReactLifeCycle = __webpack_require__(83);
-	var ReactCurrentOwner = __webpack_require__(34);
-	var ReactElement = __webpack_require__(48);
-	var ReactInstanceMap = __webpack_require__(75);
-	var ReactUpdates = __webpack_require__(19);
+	var ReactLifeCycle = __webpack_require__(86);
+	var ReactCurrentOwner = __webpack_require__(37);
+	var ReactElement = __webpack_require__(49);
+	var ReactInstanceMap = __webpack_require__(78);
+	var ReactUpdates = __webpack_require__(20);
 
-	var assign = __webpack_require__(38);
-	var invariant = __webpack_require__(39);
-	var warning = __webpack_require__(40);
+	var assign = __webpack_require__(41);
+	var invariant = __webpack_require__(42);
+	var warning = __webpack_require__(43);
 
 	function enqueueUpdate(internalInstance) {
 	  if (internalInstance !== ReactLifeCycle.currentlyMountingInstance) {
@@ -12869,10 +13498,10 @@
 
 	module.exports = ReactUpdateQueue;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 81 */
+/* 84 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -12900,10 +13529,10 @@
 
 	module.exports = ReactPropTypeLocationNames;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 82 */
+/* 85 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -12939,7 +13568,7 @@
 
 
 /***/ },
-/* 83 */
+/* 86 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -12980,7 +13609,7 @@
 
 
 /***/ },
-/* 84 */
+/* 87 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -12996,7 +13625,7 @@
 
 	'use strict';
 
-	var keyMirror = __webpack_require__(85);
+	var keyMirror = __webpack_require__(88);
 
 	var ReactPropTypeLocations = keyMirror({
 	  prop: null,
@@ -13008,7 +13637,7 @@
 
 
 /***/ },
-/* 85 */
+/* 88 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -13025,7 +13654,7 @@
 
 	'use strict';
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Constructs an enumeration with keys equal to their value.
@@ -13063,10 +13692,10 @@
 
 	module.exports = keyMirror;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 86 */
+/* 89 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -13082,8 +13711,8 @@
 
 	'use strict';
 
-	var assign = __webpack_require__(38);
-	var invariant = __webpack_require__(39);
+	var assign = __webpack_require__(41);
+	var invariant = __webpack_require__(42);
 
 	var autoGenerateWrapperClass = null;
 	var genericComponentClass = null;
@@ -13173,10 +13802,10 @@
 
 	module.exports = ReactNativeComponent;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 87 */
+/* 90 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -13224,7 +13853,7 @@
 
 
 /***/ },
-/* 88 */
+/* 91 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -13281,7 +13910,7 @@
 
 
 /***/ },
-/* 89 */
+/* 92 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -13298,10 +13927,10 @@
 
 	'use strict';
 
-	var DOMProperty = __webpack_require__(66);
+	var DOMProperty = __webpack_require__(69);
 
-	var quoteAttributeValueForBrowser = __webpack_require__(141);
-	var warning = __webpack_require__(40);
+	var quoteAttributeValueForBrowser = __webpack_require__(144);
+	var warning = __webpack_require__(43);
 
 	function shouldIgnoreValue(name, value) {
 	  return value == null ||
@@ -13473,10 +14102,10 @@
 
 	module.exports = DOMPropertyOperations;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 90 */
+/* 93 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -13494,8 +14123,8 @@
 
 	'use strict';
 
-	var ReactDOMIDOperations = __webpack_require__(105);
-	var ReactMount = __webpack_require__(54);
+	var ReactDOMIDOperations = __webpack_require__(108);
+	var ReactMount = __webpack_require__(55);
 
 	/**
 	 * Abstracts away all functionality of the reconciler that requires knowledge of
@@ -13527,7 +14156,7 @@
 
 
 /***/ },
-/* 91 */
+/* 94 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -13546,22 +14175,22 @@
 
 	'use strict';
 
-	var CSSPropertyOperations = __webpack_require__(142);
-	var DOMProperty = __webpack_require__(66);
-	var DOMPropertyOperations = __webpack_require__(89);
-	var ReactBrowserEventEmitter = __webpack_require__(73);
+	var CSSPropertyOperations = __webpack_require__(145);
+	var DOMProperty = __webpack_require__(69);
+	var DOMPropertyOperations = __webpack_require__(92);
+	var ReactBrowserEventEmitter = __webpack_require__(76);
 	var ReactComponentBrowserEnvironment =
-	  __webpack_require__(90);
-	var ReactMount = __webpack_require__(54);
-	var ReactMultiChild = __webpack_require__(143);
-	var ReactPerf = __webpack_require__(35);
+	  __webpack_require__(93);
+	var ReactMount = __webpack_require__(55);
+	var ReactMultiChild = __webpack_require__(146);
+	var ReactPerf = __webpack_require__(38);
 
-	var assign = __webpack_require__(38);
-	var escapeTextContentForBrowser = __webpack_require__(92);
-	var invariant = __webpack_require__(39);
-	var isEventSupported = __webpack_require__(137);
-	var keyOf = __webpack_require__(65);
-	var warning = __webpack_require__(40);
+	var assign = __webpack_require__(41);
+	var escapeTextContentForBrowser = __webpack_require__(95);
+	var invariant = __webpack_require__(42);
+	var isEventSupported = __webpack_require__(140);
+	var keyOf = __webpack_require__(68);
+	var warning = __webpack_require__(43);
 
 	var deleteListener = ReactBrowserEventEmitter.deleteListener;
 	var listenTo = ReactBrowserEventEmitter.listenTo;
@@ -14037,10 +14666,10 @@
 
 	module.exports = ReactDOMComponent;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 92 */
+/* 95 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -14084,506 +14713,40 @@
 
 
 /***/ },
-/* 93 */
+/* 96 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
-	 * Copyright 2013-2015 Facebook, Inc.
-	 * All rights reserved.
+	 * Entry module which injects and renders the UI
+	 * and initiates connections to backend services.
 	 *
-	 * This source code is licensed under the BSD-style license found in the
-	 * LICENSE file in the root directory of this source tree. An additional grant
-	 * of patent rights can be found in the PATENTS file in the same directory.
-	 *
-	 * @providesModule BeforeInputEventPlugin
-	 * @typechecks static-only
+	 * @module nowtalk-admin
 	 */
-
-	'use strict';
-
-	var EventConstants = __webpack_require__(69);
-	var EventPropagators = __webpack_require__(71);
-	var ExecutionEnvironment = __webpack_require__(59);
-	var FallbackCompositionState = __webpack_require__(144);
-	var SyntheticCompositionEvent = __webpack_require__(145);
-	var SyntheticInputEvent = __webpack_require__(146);
-
-	var keyOf = __webpack_require__(65);
-
-	var END_KEYCODES = [9, 13, 27, 32]; // Tab, Return, Esc, Space
-	var START_KEYCODE = 229;
-
-	var canUseCompositionEvent = (
-	  ExecutionEnvironment.canUseDOM &&
-	  'CompositionEvent' in window
-	);
-
-	var documentMode = null;
-	if (ExecutionEnvironment.canUseDOM && 'documentMode' in document) {
-	  documentMode = document.documentMode;
-	}
-
-	// Webkit offers a very useful `textInput` event that can be used to
-	// directly represent `beforeInput`. The IE `textinput` event is not as
-	// useful, so we don't use it.
-	var canUseTextInputEvent = (
-	  ExecutionEnvironment.canUseDOM &&
-	  'TextEvent' in window &&
-	  !documentMode &&
-	  !isPresto()
-	);
-
-	// In IE9+, we have access to composition events, but the data supplied
-	// by the native compositionend event may be incorrect. Japanese ideographic
-	// spaces, for instance (\u3000) are not recorded correctly.
-	var useFallbackCompositionData = (
-	  ExecutionEnvironment.canUseDOM &&
-	  (
-	    (!canUseCompositionEvent || documentMode && documentMode > 8 && documentMode <= 11)
-	  )
-	);
-
-	/**
-	 * Opera <= 12 includes TextEvent in window, but does not fire
-	 * text input events. Rely on keypress instead.
-	 */
-	function isPresto() {
-	  var opera = window.opera;
-	  return (
-	    typeof opera === 'object' &&
-	    typeof opera.version === 'function' &&
-	    parseInt(opera.version(), 10) <= 12
-	  );
-	}
-
-	var SPACEBAR_CODE = 32;
-	var SPACEBAR_CHAR = String.fromCharCode(SPACEBAR_CODE);
-
-	var topLevelTypes = EventConstants.topLevelTypes;
-
-	// Events and their corresponding property names.
-	var eventTypes = {
-	  beforeInput: {
-	    phasedRegistrationNames: {
-	      bubbled: keyOf({onBeforeInput: null}),
-	      captured: keyOf({onBeforeInputCapture: null})
-	    },
-	    dependencies: [
-	      topLevelTypes.topCompositionEnd,
-	      topLevelTypes.topKeyPress,
-	      topLevelTypes.topTextInput,
-	      topLevelTypes.topPaste
-	    ]
-	  },
-	  compositionEnd: {
-	    phasedRegistrationNames: {
-	      bubbled: keyOf({onCompositionEnd: null}),
-	      captured: keyOf({onCompositionEndCapture: null})
-	    },
-	    dependencies: [
-	      topLevelTypes.topBlur,
-	      topLevelTypes.topCompositionEnd,
-	      topLevelTypes.topKeyDown,
-	      topLevelTypes.topKeyPress,
-	      topLevelTypes.topKeyUp,
-	      topLevelTypes.topMouseDown
-	    ]
-	  },
-	  compositionStart: {
-	    phasedRegistrationNames: {
-	      bubbled: keyOf({onCompositionStart: null}),
-	      captured: keyOf({onCompositionStartCapture: null})
-	    },
-	    dependencies: [
-	      topLevelTypes.topBlur,
-	      topLevelTypes.topCompositionStart,
-	      topLevelTypes.topKeyDown,
-	      topLevelTypes.topKeyPress,
-	      topLevelTypes.topKeyUp,
-	      topLevelTypes.topMouseDown
-	    ]
-	  },
-	  compositionUpdate: {
-	    phasedRegistrationNames: {
-	      bubbled: keyOf({onCompositionUpdate: null}),
-	      captured: keyOf({onCompositionUpdateCapture: null})
-	    },
-	    dependencies: [
-	      topLevelTypes.topBlur,
-	      topLevelTypes.topCompositionUpdate,
-	      topLevelTypes.topKeyDown,
-	      topLevelTypes.topKeyPress,
-	      topLevelTypes.topKeyUp,
-	      topLevelTypes.topMouseDown
-	    ]
-	  }
-	};
-
-	// Track whether we've ever handled a keypress on the space key.
-	var hasSpaceKeypress = false;
-
-	/**
-	 * Return whether a native keypress event is assumed to be a command.
-	 * This is required because Firefox fires `keypress` events for key commands
-	 * (cut, copy, select-all, etc.) even though no character is inserted.
-	 */
-	function isKeypressCommand(nativeEvent) {
-	  return (
-	    (nativeEvent.ctrlKey || nativeEvent.altKey || nativeEvent.metaKey) &&
-	    // ctrlKey && altKey is equivalent to AltGr, and is not a command.
-	    !(nativeEvent.ctrlKey && nativeEvent.altKey)
-	  );
-	}
-
-
-	/**
-	 * Translate native top level events into event types.
-	 *
-	 * @param {string} topLevelType
-	 * @return {object}
-	 */
-	function getCompositionEventType(topLevelType) {
-	  switch (topLevelType) {
-	    case topLevelTypes.topCompositionStart:
-	      return eventTypes.compositionStart;
-	    case topLevelTypes.topCompositionEnd:
-	      return eventTypes.compositionEnd;
-	    case topLevelTypes.topCompositionUpdate:
-	      return eventTypes.compositionUpdate;
-	  }
-	}
-
-	/**
-	 * Does our fallback best-guess model think this event signifies that
-	 * composition has begun?
-	 *
-	 * @param {string} topLevelType
-	 * @param {object} nativeEvent
-	 * @return {boolean}
-	 */
-	function isFallbackCompositionStart(topLevelType, nativeEvent) {
-	  return (
-	    topLevelType === topLevelTypes.topKeyDown &&
-	    nativeEvent.keyCode === START_KEYCODE
-	  );
-	}
-
-	/**
-	 * Does our fallback mode think that this event is the end of composition?
-	 *
-	 * @param {string} topLevelType
-	 * @param {object} nativeEvent
-	 * @return {boolean}
-	 */
-	function isFallbackCompositionEnd(topLevelType, nativeEvent) {
-	  switch (topLevelType) {
-	    case topLevelTypes.topKeyUp:
-	      // Command keys insert or clear IME input.
-	      return (END_KEYCODES.indexOf(nativeEvent.keyCode) !== -1);
-	    case topLevelTypes.topKeyDown:
-	      // Expect IME keyCode on each keydown. If we get any other
-	      // code we must have exited earlier.
-	      return (nativeEvent.keyCode !== START_KEYCODE);
-	    case topLevelTypes.topKeyPress:
-	    case topLevelTypes.topMouseDown:
-	    case topLevelTypes.topBlur:
-	      // Events are not possible without cancelling IME.
-	      return true;
-	    default:
-	      return false;
-	  }
-	}
-
-	/**
-	 * Google Input Tools provides composition data via a CustomEvent,
-	 * with the `data` property populated in the `detail` object. If this
-	 * is available on the event object, use it. If not, this is a plain
-	 * composition event and we have nothing special to extract.
-	 *
-	 * @param {object} nativeEvent
-	 * @return {?string}
-	 */
-	function getDataFromCustomEvent(nativeEvent) {
-	  var detail = nativeEvent.detail;
-	  if (typeof detail === 'object' && 'data' in detail) {
-	    return detail.data;
-	  }
-	  return null;
-	}
-
-	// Track the current IME composition fallback object, if any.
-	var currentComposition = null;
-
-	/**
-	 * @param {string} topLevelType Record from `EventConstants`.
-	 * @param {DOMEventTarget} topLevelTarget The listening component root node.
-	 * @param {string} topLevelTargetID ID of `topLevelTarget`.
-	 * @param {object} nativeEvent Native browser event.
-	 * @return {?object} A SyntheticCompositionEvent.
-	 */
-	function extractCompositionEvent(
-	  topLevelType,
-	  topLevelTarget,
-	  topLevelTargetID,
-	  nativeEvent
+	!/* require */(/* limit */function() { var __WEBPACK_AMD_REQUIRE_ARRAY__ = [
+	  __webpack_require__(7),
+	  __webpack_require__(5),
+	  __webpack_require__(6)
+	]; (function (
+	  React,
+	  Admin,
+	  config
 	) {
-	  var eventType;
-	  var fallbackData;
+	  var app
+	    ,  container;
 
-	  if (canUseCompositionEvent) {
-	    eventType = getCompositionEventType(topLevelType);
-	  } else if (!currentComposition) {
-	    if (isFallbackCompositionStart(topLevelType, nativeEvent)) {
-	      eventType = eventTypes.compositionStart;
-	    }
-	  } else if (isFallbackCompositionEnd(topLevelType, nativeEvent)) {
-	    eventType = eventTypes.compositionEnd;
-	  }
+	  container = document.createElement('div');
+	  container.className = 'nowtalk-admin__wrapper';
+	  document.body.appendChild(container);
 
-	  if (!eventType) {
-	    return null;
-	  }
-
-	  if (useFallbackCompositionData) {
-	    // The current composition is stored statically and must not be
-	    // overwritten while composition continues.
-	    if (!currentComposition && eventType === eventTypes.compositionStart) {
-	      currentComposition = FallbackCompositionState.getPooled(topLevelTarget);
-	    } else if (eventType === eventTypes.compositionEnd) {
-	      if (currentComposition) {
-	        fallbackData = currentComposition.getData();
-	      }
-	    }
-	  }
-
-	  var event = SyntheticCompositionEvent.getPooled(
-	    eventType,
-	    topLevelTargetID,
-	    nativeEvent
+	  React.render(
+	    React.createElement(Admin, null) ,
+	    container
 	  );
-
-	  if (fallbackData) {
-	    // Inject data generated from fallback path into the synthetic event.
-	    // This matches the property of native CompositionEventInterface.
-	    event.data = fallbackData;
-	  } else {
-	    var customData = getDataFromCustomEvent(nativeEvent);
-	    if (customData !== null) {
-	      event.data = customData;
-	    }
-	  }
-
-	  EventPropagators.accumulateTwoPhaseDispatches(event);
-	  return event;
-	}
-
-	/**
-	 * @param {string} topLevelType Record from `EventConstants`.
-	 * @param {object} nativeEvent Native browser event.
-	 * @return {?string} The string corresponding to this `beforeInput` event.
-	 */
-	function getNativeBeforeInputChars(topLevelType, nativeEvent) {
-	  switch (topLevelType) {
-	    case topLevelTypes.topCompositionEnd:
-	      return getDataFromCustomEvent(nativeEvent);
-	    case topLevelTypes.topKeyPress:
-	      /**
-	       * If native `textInput` events are available, our goal is to make
-	       * use of them. However, there is a special case: the spacebar key.
-	       * In Webkit, preventing default on a spacebar `textInput` event
-	       * cancels character insertion, but it *also* causes the browser
-	       * to fall back to its default spacebar behavior of scrolling the
-	       * page.
-	       *
-	       * Tracking at:
-	       * https://code.google.com/p/chromium/issues/detail?id=355103
-	       *
-	       * To avoid this issue, use the keypress event as if no `textInput`
-	       * event is available.
-	       */
-	      var which = nativeEvent.which;
-	      if (which !== SPACEBAR_CODE) {
-	        return null;
-	      }
-
-	      hasSpaceKeypress = true;
-	      return SPACEBAR_CHAR;
-
-	    case topLevelTypes.topTextInput:
-	      // Record the characters to be added to the DOM.
-	      var chars = nativeEvent.data;
-
-	      // If it's a spacebar character, assume that we have already handled
-	      // it at the keypress level and bail immediately. Android Chrome
-	      // doesn't give us keycodes, so we need to blacklist it.
-	      if (chars === SPACEBAR_CHAR && hasSpaceKeypress) {
-	        return null;
-	      }
-
-	      return chars;
-
-	    default:
-	      // For other native event types, do nothing.
-	      return null;
-	  }
-	}
-
-	/**
-	 * For browsers that do not provide the `textInput` event, extract the
-	 * appropriate string to use for SyntheticInputEvent.
-	 *
-	 * @param {string} topLevelType Record from `EventConstants`.
-	 * @param {object} nativeEvent Native browser event.
-	 * @return {?string} The fallback string for this `beforeInput` event.
-	 */
-	function getFallbackBeforeInputChars(topLevelType, nativeEvent) {
-	  // If we are currently composing (IME) and using a fallback to do so,
-	  // try to extract the composed characters from the fallback object.
-	  if (currentComposition) {
-	    if (
-	      topLevelType === topLevelTypes.topCompositionEnd ||
-	      isFallbackCompositionEnd(topLevelType, nativeEvent)
-	    ) {
-	      var chars = currentComposition.getData();
-	      FallbackCompositionState.release(currentComposition);
-	      currentComposition = null;
-	      return chars;
-	    }
-	    return null;
-	  }
-
-	  switch (topLevelType) {
-	    case topLevelTypes.topPaste:
-	      // If a paste event occurs after a keypress, throw out the input
-	      // chars. Paste events should not lead to BeforeInput events.
-	      return null;
-	    case topLevelTypes.topKeyPress:
-	      /**
-	       * As of v27, Firefox may fire keypress events even when no character
-	       * will be inserted. A few possibilities:
-	       *
-	       * - `which` is `0`. Arrow keys, Esc key, etc.
-	       *
-	       * - `which` is the pressed key code, but no char is available.
-	       *   Ex: 'AltGr + d` in Polish. There is no modified character for
-	       *   this key combination and no character is inserted into the
-	       *   document, but FF fires the keypress for char code `100` anyway.
-	       *   No `input` event will occur.
-	       *
-	       * - `which` is the pressed key code, but a command combination is
-	       *   being used. Ex: `Cmd+C`. No character is inserted, and no
-	       *   `input` event will occur.
-	       */
-	      if (nativeEvent.which && !isKeypressCommand(nativeEvent)) {
-	        return String.fromCharCode(nativeEvent.which);
-	      }
-	      return null;
-	    case topLevelTypes.topCompositionEnd:
-	      return useFallbackCompositionData ? null : nativeEvent.data;
-	    default:
-	      return null;
-	  }
-	}
-
-	/**
-	 * Extract a SyntheticInputEvent for `beforeInput`, based on either native
-	 * `textInput` or fallback behavior.
-	 *
-	 * @param {string} topLevelType Record from `EventConstants`.
-	 * @param {DOMEventTarget} topLevelTarget The listening component root node.
-	 * @param {string} topLevelTargetID ID of `topLevelTarget`.
-	 * @param {object} nativeEvent Native browser event.
-	 * @return {?object} A SyntheticInputEvent.
-	 */
-	function extractBeforeInputEvent(
-	  topLevelType,
-	  topLevelTarget,
-	  topLevelTargetID,
-	  nativeEvent
-	) {
-	  var chars;
-
-	  if (canUseTextInputEvent) {
-	    chars = getNativeBeforeInputChars(topLevelType, nativeEvent);
-	  } else {
-	    chars = getFallbackBeforeInputChars(topLevelType, nativeEvent);
-	  }
-
-	  // If no characters are being inserted, no BeforeInput event should
-	  // be fired.
-	  if (!chars) {
-	    return null;
-	  }
-
-	  var event = SyntheticInputEvent.getPooled(
-	    eventTypes.beforeInput,
-	    topLevelTargetID,
-	    nativeEvent
-	  );
-
-	  event.data = chars;
-	  EventPropagators.accumulateTwoPhaseDispatches(event);
-	  return event;
-	}
-
-	/**
-	 * Create an `onBeforeInput` event to match
-	 * http://www.w3.org/TR/2013/WD-DOM-Level-3-Events-20131105/#events-inputevents.
-	 *
-	 * This event plugin is based on the native `textInput` event
-	 * available in Chrome, Safari, Opera, and IE. This event fires after
-	 * `onKeyPress` and `onCompositionEnd`, but before `onInput`.
-	 *
-	 * `beforeInput` is spec'd but not implemented in any browsers, and
-	 * the `input` event does not provide any useful information about what has
-	 * actually been added, contrary to the spec. Thus, `textInput` is the best
-	 * available event to identify the characters that have actually been inserted
-	 * into the target node.
-	 *
-	 * This plugin is also responsible for emitting `composition` events, thus
-	 * allowing us to share composition fallback code for both `beforeInput` and
-	 * `composition` event types.
-	 */
-	var BeforeInputEventPlugin = {
-
-	  eventTypes: eventTypes,
-
-	  /**
-	   * @param {string} topLevelType Record from `EventConstants`.
-	   * @param {DOMEventTarget} topLevelTarget The listening component root node.
-	   * @param {string} topLevelTargetID ID of `topLevelTarget`.
-	   * @param {object} nativeEvent Native browser event.
-	   * @return {*} An accumulation of synthetic events.
-	   * @see {EventPluginHub.extractEvents}
-	   */
-	  extractEvents: function(
-	    topLevelType,
-	    topLevelTarget,
-	    topLevelTargetID,
-	    nativeEvent
-	  ) {
-	    return [
-	      extractCompositionEvent(
-	        topLevelType,
-	        topLevelTarget,
-	        topLevelTargetID,
-	        nativeEvent
-	      ),
-	      extractBeforeInputEvent(
-	        topLevelType,
-	        topLevelTarget,
-	        topLevelTargetID,
-	        nativeEvent
-	      )
-	    ];
-	  }
-	};
-
-	module.exports = BeforeInputEventPlugin;
+	}.apply(null, __WEBPACK_AMD_REQUIRE_ARRAY__));}()); // end define
 
 
 /***/ },
-/* 94 */
+/* 97 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -14599,16 +14762,16 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
-	var EventPluginHub = __webpack_require__(70);
-	var EventPropagators = __webpack_require__(71);
-	var ExecutionEnvironment = __webpack_require__(59);
-	var ReactUpdates = __webpack_require__(19);
-	var SyntheticEvent = __webpack_require__(76);
+	var EventConstants = __webpack_require__(72);
+	var EventPluginHub = __webpack_require__(73);
+	var EventPropagators = __webpack_require__(74);
+	var ExecutionEnvironment = __webpack_require__(60);
+	var ReactUpdates = __webpack_require__(20);
+	var SyntheticEvent = __webpack_require__(79);
 
-	var isEventSupported = __webpack_require__(137);
-	var isTextInputElement = __webpack_require__(147);
-	var keyOf = __webpack_require__(65);
+	var isEventSupported = __webpack_require__(140);
+	var isTextInputElement = __webpack_require__(150);
+	var keyOf = __webpack_require__(68);
 
 	var topLevelTypes = EventConstants.topLevelTypes;
 
@@ -14969,40 +15132,36 @@
 
 
 /***/ },
-/* 95 */
+/* 98 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
-	 * Entry module which injects and renders the UI
-	 * and initiates connections to backend services.
+	 * Copyright 2013-2015, Facebook, Inc.
+	 * All rights reserved.
 	 *
-	 * @module nowtalk-admin
+	 * This source code is licensed under the BSD-style license found in the
+	 * LICENSE file in the root directory of this source tree. An additional grant
+	 * of patent rights can be found in the PATENTS file in the same directory.
+	 *
+	 * @providesModule ClientReactRootIndex
+	 * @typechecks
 	 */
-	!/* require */(/* limit */function() { var __WEBPACK_AMD_REQUIRE_ARRAY__ = [
-	  __webpack_require__(7),
-	  __webpack_require__(5),
-	  __webpack_require__(6)
-	]; (function (
-	  React,
-	  Admin,
-	  config
-	) {
-	  var app
-	    ,  container;
 
-	  container = document.createElement('div');
-	  container.className = 'nowtalk-admin__wrapper';
-	  document.body.appendChild(container);
+	'use strict';
 
-	  React.render(
-	    React.createElement(Admin, null) ,
-	    container
-	  );
-	}.apply(null, __WEBPACK_AMD_REQUIRE_ARRAY__));}()); // end define
+	var nextReactRootIndex = 0;
+
+	var ClientReactRootIndex = {
+	  createReactRootIndex: function() {
+	    return nextReactRootIndex++;
+	  }
+	};
+
+	module.exports = ClientReactRootIndex;
 
 
 /***/ },
-/* 96 */
+/* 99 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -15018,7 +15177,7 @@
 
 	'use strict';
 
-	var keyOf = __webpack_require__(65);
+	var keyOf = __webpack_require__(68);
 
 	/**
 	 * Module that is injectable into `EventPluginHub`, that specifies a
@@ -15045,7 +15204,7 @@
 
 
 /***/ },
-/* 97 */
+/* 100 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -15062,12 +15221,12 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
-	var EventPropagators = __webpack_require__(71);
-	var SyntheticMouseEvent = __webpack_require__(148);
+	var EventConstants = __webpack_require__(72);
+	var EventPropagators = __webpack_require__(74);
+	var SyntheticMouseEvent = __webpack_require__(151);
 
-	var ReactMount = __webpack_require__(54);
-	var keyOf = __webpack_require__(65);
+	var ReactMount = __webpack_require__(55);
+	var keyOf = __webpack_require__(68);
 
 	var topLevelTypes = EventConstants.topLevelTypes;
 	var getFirstReactDOM = ReactMount.getFirstReactDOM;
@@ -15189,7 +15348,7 @@
 
 
 /***/ },
-/* 98 */
+/* 101 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -15207,8 +15366,8 @@
 
 	'use strict';
 
-	var DOMProperty = __webpack_require__(66);
-	var ExecutionEnvironment = __webpack_require__(59);
+	var DOMProperty = __webpack_require__(69);
+	var ExecutionEnvironment = __webpack_require__(60);
 
 	var MUST_USE_ATTRIBUTE = DOMProperty.injection.MUST_USE_ATTRIBUTE;
 	var MUST_USE_PROPERTY = DOMProperty.injection.MUST_USE_PROPERTY;
@@ -15404,7 +15563,7 @@
 
 
 /***/ },
-/* 99 */
+/* 102 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -15421,9 +15580,9 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
+	var EventConstants = __webpack_require__(72);
 
-	var emptyFunction = __webpack_require__(63);
+	var emptyFunction = __webpack_require__(66);
 
 	var topLevelTypes = EventConstants.topLevelTypes;
 
@@ -15466,7 +15625,7 @@
 
 
 /***/ },
-/* 100 */
+/* 103 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -15482,7 +15641,7 @@
 
 	'use strict';
 
-	var findDOMNode = __webpack_require__(57);
+	var findDOMNode = __webpack_require__(58);
 
 	var ReactBrowserComponentMixin = {
 	  /**
@@ -15501,7 +15660,7 @@
 
 
 /***/ },
-/* 101 */
+/* 104 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -15517,11 +15676,11 @@
 
 	'use strict';
 
-	var ReactUpdates = __webpack_require__(19);
-	var Transaction = __webpack_require__(37);
+	var ReactUpdates = __webpack_require__(20);
+	var Transaction = __webpack_require__(40);
 
-	var assign = __webpack_require__(38);
-	var emptyFunction = __webpack_require__(63);
+	var assign = __webpack_require__(41);
+	var emptyFunction = __webpack_require__(66);
 
 	var RESET_BATCHED_UPDATES = {
 	  initialize: emptyFunction,
@@ -15578,7 +15737,7 @@
 
 
 /***/ },
-/* 102 */
+/* 105 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -15594,12 +15753,12 @@
 
 	'use strict';
 
-	var AutoFocusMixin = __webpack_require__(149);
-	var ReactBrowserComponentMixin = __webpack_require__(100);
-	var ReactClass = __webpack_require__(46);
-	var ReactElement = __webpack_require__(48);
+	var AutoFocusMixin = __webpack_require__(152);
+	var ReactBrowserComponentMixin = __webpack_require__(103);
+	var ReactClass = __webpack_require__(47);
+	var ReactElement = __webpack_require__(49);
 
-	var keyMirror = __webpack_require__(85);
+	var keyMirror = __webpack_require__(88);
 
 	var button = ReactElement.createFactory('button');
 
@@ -15646,7 +15805,7 @@
 
 
 /***/ },
-/* 103 */
+/* 106 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -15662,11 +15821,11 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
-	var LocalEventTrapMixin = __webpack_require__(150);
-	var ReactBrowserComponentMixin = __webpack_require__(100);
-	var ReactClass = __webpack_require__(46);
-	var ReactElement = __webpack_require__(48);
+	var EventConstants = __webpack_require__(72);
+	var LocalEventTrapMixin = __webpack_require__(153);
+	var ReactBrowserComponentMixin = __webpack_require__(103);
+	var ReactClass = __webpack_require__(47);
+	var ReactElement = __webpack_require__(49);
 
 	var form = ReactElement.createFactory('form');
 
@@ -15699,7 +15858,7 @@
 
 
 /***/ },
-/* 104 */
+/* 107 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -15715,11 +15874,11 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
-	var LocalEventTrapMixin = __webpack_require__(150);
-	var ReactBrowserComponentMixin = __webpack_require__(100);
-	var ReactClass = __webpack_require__(46);
-	var ReactElement = __webpack_require__(48);
+	var EventConstants = __webpack_require__(72);
+	var LocalEventTrapMixin = __webpack_require__(153);
+	var ReactBrowserComponentMixin = __webpack_require__(103);
+	var ReactClass = __webpack_require__(47);
+	var ReactElement = __webpack_require__(49);
 
 	var img = ReactElement.createFactory('img');
 
@@ -15749,7 +15908,7 @@
 
 
 /***/ },
-/* 105 */
+/* 108 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -15768,14 +15927,14 @@
 
 	'use strict';
 
-	var CSSPropertyOperations = __webpack_require__(142);
-	var DOMChildrenOperations = __webpack_require__(151);
-	var DOMPropertyOperations = __webpack_require__(89);
-	var ReactMount = __webpack_require__(54);
-	var ReactPerf = __webpack_require__(35);
+	var CSSPropertyOperations = __webpack_require__(145);
+	var DOMChildrenOperations = __webpack_require__(154);
+	var DOMPropertyOperations = __webpack_require__(92);
+	var ReactMount = __webpack_require__(55);
+	var ReactPerf = __webpack_require__(38);
 
-	var invariant = __webpack_require__(39);
-	var setInnerHTML = __webpack_require__(124);
+	var invariant = __webpack_require__(42);
+	var setInnerHTML = __webpack_require__(127);
 
 	/**
 	 * Errors for properties that should not be updated with `updatePropertyById()`.
@@ -15917,10 +16076,10 @@
 
 	module.exports = ReactDOMIDOperations;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 106 */
+/* 109 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -15936,11 +16095,11 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
-	var LocalEventTrapMixin = __webpack_require__(150);
-	var ReactBrowserComponentMixin = __webpack_require__(100);
-	var ReactClass = __webpack_require__(46);
-	var ReactElement = __webpack_require__(48);
+	var EventConstants = __webpack_require__(72);
+	var LocalEventTrapMixin = __webpack_require__(153);
+	var ReactBrowserComponentMixin = __webpack_require__(103);
+	var ReactClass = __webpack_require__(47);
+	var ReactElement = __webpack_require__(49);
 
 	var iframe = ReactElement.createFactory('iframe');
 
@@ -15969,7 +16128,7 @@
 
 
 /***/ },
-/* 107 */
+/* 110 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -15985,17 +16144,17 @@
 
 	'use strict';
 
-	var AutoFocusMixin = __webpack_require__(149);
-	var DOMPropertyOperations = __webpack_require__(89);
-	var LinkedValueUtils = __webpack_require__(152);
-	var ReactBrowserComponentMixin = __webpack_require__(100);
-	var ReactClass = __webpack_require__(46);
-	var ReactElement = __webpack_require__(48);
-	var ReactMount = __webpack_require__(54);
-	var ReactUpdates = __webpack_require__(19);
+	var AutoFocusMixin = __webpack_require__(152);
+	var DOMPropertyOperations = __webpack_require__(92);
+	var LinkedValueUtils = __webpack_require__(155);
+	var ReactBrowserComponentMixin = __webpack_require__(103);
+	var ReactClass = __webpack_require__(47);
+	var ReactElement = __webpack_require__(49);
+	var ReactMount = __webpack_require__(55);
+	var ReactUpdates = __webpack_require__(20);
 
-	var assign = __webpack_require__(38);
-	var invariant = __webpack_require__(39);
+	var assign = __webpack_require__(41);
+	var invariant = __webpack_require__(42);
 
 	var input = ReactElement.createFactory('input');
 
@@ -16146,10 +16305,10 @@
 
 	module.exports = ReactDOMInput;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 108 */
+/* 111 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -16165,11 +16324,11 @@
 
 	'use strict';
 
-	var ReactBrowserComponentMixin = __webpack_require__(100);
-	var ReactClass = __webpack_require__(46);
-	var ReactElement = __webpack_require__(48);
+	var ReactBrowserComponentMixin = __webpack_require__(103);
+	var ReactClass = __webpack_require__(47);
+	var ReactElement = __webpack_require__(49);
 
-	var warning = __webpack_require__(40);
+	var warning = __webpack_require__(43);
 
 	var option = ReactElement.createFactory('option');
 
@@ -16201,10 +16360,10 @@
 
 	module.exports = ReactDOMOption;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 109 */
+/* 112 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -16220,14 +16379,14 @@
 
 	'use strict';
 
-	var AutoFocusMixin = __webpack_require__(149);
-	var LinkedValueUtils = __webpack_require__(152);
-	var ReactBrowserComponentMixin = __webpack_require__(100);
-	var ReactClass = __webpack_require__(46);
-	var ReactElement = __webpack_require__(48);
-	var ReactUpdates = __webpack_require__(19);
+	var AutoFocusMixin = __webpack_require__(152);
+	var LinkedValueUtils = __webpack_require__(155);
+	var ReactBrowserComponentMixin = __webpack_require__(103);
+	var ReactClass = __webpack_require__(47);
+	var ReactElement = __webpack_require__(49);
+	var ReactUpdates = __webpack_require__(20);
 
-	var assign = __webpack_require__(38);
+	var assign = __webpack_require__(41);
 
 	var select = ReactElement.createFactory('select');
 
@@ -16386,7 +16545,7 @@
 
 
 /***/ },
-/* 110 */
+/* 113 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -16402,18 +16561,18 @@
 
 	'use strict';
 
-	var AutoFocusMixin = __webpack_require__(149);
-	var DOMPropertyOperations = __webpack_require__(89);
-	var LinkedValueUtils = __webpack_require__(152);
-	var ReactBrowserComponentMixin = __webpack_require__(100);
-	var ReactClass = __webpack_require__(46);
-	var ReactElement = __webpack_require__(48);
-	var ReactUpdates = __webpack_require__(19);
+	var AutoFocusMixin = __webpack_require__(152);
+	var DOMPropertyOperations = __webpack_require__(92);
+	var LinkedValueUtils = __webpack_require__(155);
+	var ReactBrowserComponentMixin = __webpack_require__(103);
+	var ReactClass = __webpack_require__(47);
+	var ReactElement = __webpack_require__(49);
+	var ReactUpdates = __webpack_require__(20);
 
-	var assign = __webpack_require__(38);
-	var invariant = __webpack_require__(39);
+	var assign = __webpack_require__(41);
+	var invariant = __webpack_require__(42);
 
-	var warning = __webpack_require__(40);
+	var warning = __webpack_require__(43);
 
 	var textarea = ReactElement.createFactory('textarea');
 
@@ -16526,10 +16685,10 @@
 
 	module.exports = ReactDOMTextarea;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 111 */
+/* 114 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -16546,16 +16705,16 @@
 
 	'use strict';
 
-	var EventListener = __webpack_require__(153);
-	var ExecutionEnvironment = __webpack_require__(59);
-	var PooledClass = __webpack_require__(33);
-	var ReactInstanceHandles = __webpack_require__(53);
-	var ReactMount = __webpack_require__(54);
-	var ReactUpdates = __webpack_require__(19);
+	var EventListener = __webpack_require__(156);
+	var ExecutionEnvironment = __webpack_require__(60);
+	var PooledClass = __webpack_require__(36);
+	var ReactInstanceHandles = __webpack_require__(54);
+	var ReactMount = __webpack_require__(55);
+	var ReactUpdates = __webpack_require__(20);
 
-	var assign = __webpack_require__(38);
-	var getEventTarget = __webpack_require__(139);
-	var getUnboundedScrollPosition = __webpack_require__(154);
+	var assign = __webpack_require__(41);
+	var getEventTarget = __webpack_require__(142);
+	var getUnboundedScrollPosition = __webpack_require__(157);
 
 	/**
 	 * Finds the parent React component of `node`.
@@ -16716,7 +16875,7 @@
 
 
 /***/ },
-/* 112 */
+/* 115 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -16732,17 +16891,17 @@
 
 	'use strict';
 
-	var DOMProperty = __webpack_require__(66);
-	var EventPluginHub = __webpack_require__(70);
-	var ReactComponentEnvironment = __webpack_require__(138);
-	var ReactClass = __webpack_require__(46);
-	var ReactEmptyComponent = __webpack_require__(72);
-	var ReactBrowserEventEmitter = __webpack_require__(73);
-	var ReactNativeComponent = __webpack_require__(86);
-	var ReactDOMComponent = __webpack_require__(91);
-	var ReactPerf = __webpack_require__(35);
-	var ReactRootIndex = __webpack_require__(119);
-	var ReactUpdates = __webpack_require__(19);
+	var DOMProperty = __webpack_require__(69);
+	var EventPluginHub = __webpack_require__(73);
+	var ReactComponentEnvironment = __webpack_require__(141);
+	var ReactClass = __webpack_require__(47);
+	var ReactEmptyComponent = __webpack_require__(75);
+	var ReactBrowserEventEmitter = __webpack_require__(76);
+	var ReactNativeComponent = __webpack_require__(89);
+	var ReactDOMComponent = __webpack_require__(94);
+	var ReactPerf = __webpack_require__(38);
+	var ReactRootIndex = __webpack_require__(122);
+	var ReactUpdates = __webpack_require__(20);
 
 	var ReactInjection = {
 	  Component: ReactComponentEnvironment.injection,
@@ -16762,7 +16921,7 @@
 
 
 /***/ },
-/* 113 */
+/* 116 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -16779,14 +16938,14 @@
 
 	'use strict';
 
-	var CallbackQueue = __webpack_require__(32);
-	var PooledClass = __webpack_require__(33);
-	var ReactBrowserEventEmitter = __webpack_require__(73);
-	var ReactInputSelection = __webpack_require__(155);
-	var ReactPutListenerQueue = __webpack_require__(156);
-	var Transaction = __webpack_require__(37);
+	var CallbackQueue = __webpack_require__(35);
+	var PooledClass = __webpack_require__(36);
+	var ReactBrowserEventEmitter = __webpack_require__(76);
+	var ReactInputSelection = __webpack_require__(158);
+	var ReactPutListenerQueue = __webpack_require__(159);
+	var Transaction = __webpack_require__(40);
 
-	var assign = __webpack_require__(38);
+	var assign = __webpack_require__(41);
 
 	/**
 	 * Ensures that, when possible, the selection range (currently selected text
@@ -16942,7 +17101,7 @@
 
 
 /***/ },
-/* 114 */
+/* 117 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -16958,15 +17117,15 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
-	var EventPropagators = __webpack_require__(71);
-	var ReactInputSelection = __webpack_require__(155);
-	var SyntheticEvent = __webpack_require__(76);
+	var EventConstants = __webpack_require__(72);
+	var EventPropagators = __webpack_require__(74);
+	var ReactInputSelection = __webpack_require__(158);
+	var SyntheticEvent = __webpack_require__(79);
 
-	var getActiveElement = __webpack_require__(157);
-	var isTextInputElement = __webpack_require__(147);
-	var keyOf = __webpack_require__(65);
-	var shallowEqual = __webpack_require__(60);
+	var getActiveElement = __webpack_require__(160);
+	var isTextInputElement = __webpack_require__(150);
+	var keyOf = __webpack_require__(68);
+	var shallowEqual = __webpack_require__(63);
 
 	var topLevelTypes = EventConstants.topLevelTypes;
 
@@ -17141,7 +17300,7 @@
 
 
 /***/ },
-/* 115 */
+/* 118 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -17176,7 +17335,7 @@
 
 
 /***/ },
-/* 116 */
+/* 119 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -17192,24 +17351,24 @@
 
 	'use strict';
 
-	var EventConstants = __webpack_require__(69);
-	var EventPluginUtils = __webpack_require__(43);
-	var EventPropagators = __webpack_require__(71);
-	var SyntheticClipboardEvent = __webpack_require__(159);
-	var SyntheticEvent = __webpack_require__(76);
-	var SyntheticFocusEvent = __webpack_require__(160);
-	var SyntheticKeyboardEvent = __webpack_require__(161);
-	var SyntheticMouseEvent = __webpack_require__(148);
-	var SyntheticDragEvent = __webpack_require__(158);
-	var SyntheticTouchEvent = __webpack_require__(162);
-	var SyntheticUIEvent = __webpack_require__(163);
-	var SyntheticWheelEvent = __webpack_require__(164);
+	var EventConstants = __webpack_require__(72);
+	var EventPluginUtils = __webpack_require__(44);
+	var EventPropagators = __webpack_require__(74);
+	var SyntheticClipboardEvent = __webpack_require__(162);
+	var SyntheticEvent = __webpack_require__(79);
+	var SyntheticFocusEvent = __webpack_require__(163);
+	var SyntheticKeyboardEvent = __webpack_require__(164);
+	var SyntheticMouseEvent = __webpack_require__(151);
+	var SyntheticDragEvent = __webpack_require__(161);
+	var SyntheticTouchEvent = __webpack_require__(165);
+	var SyntheticUIEvent = __webpack_require__(166);
+	var SyntheticWheelEvent = __webpack_require__(167);
 
-	var getEventCharCode = __webpack_require__(165);
+	var getEventCharCode = __webpack_require__(168);
 
-	var invariant = __webpack_require__(39);
-	var keyOf = __webpack_require__(65);
-	var warning = __webpack_require__(40);
+	var invariant = __webpack_require__(42);
+	var keyOf = __webpack_require__(68);
+	var warning = __webpack_require__(43);
 
 	var topLevelTypes = EventConstants.topLevelTypes;
 
@@ -17604,10 +17763,10 @@
 
 	module.exports = SimpleEventPlugin;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 117 */
+/* 120 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -17625,7 +17784,7 @@
 
 	'use strict';
 
-	var DOMProperty = __webpack_require__(66);
+	var DOMProperty = __webpack_require__(69);
 
 	var MUST_USE_ATTRIBUTE = DOMProperty.injection.MUST_USE_ATTRIBUTE;
 
@@ -17705,7 +17864,7 @@
 
 
 /***/ },
-/* 118 */
+/* 121 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -17723,10 +17882,10 @@
 	'use strict';
 
 	// Defeat circular references by requiring this directly.
-	var ReactClass = __webpack_require__(46);
-	var ReactElement = __webpack_require__(48);
+	var ReactClass = __webpack_require__(47);
+	var ReactElement = __webpack_require__(49);
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Create a component that will throw an exception when unmounted.
@@ -17767,10 +17926,10 @@
 
 	module.exports = createFullPageComponent;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 119 */
+/* 122 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -17805,7 +17964,7 @@
 
 
 /***/ },
-/* 120 */
+/* 123 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -17821,7 +17980,7 @@
 
 	'use strict';
 
-	var adler32 = __webpack_require__(166);
+	var adler32 = __webpack_require__(169);
 
 	var ReactMarkupChecksum = {
 	  CHECKSUM_ATTR_NAME: 'data-react-checksum',
@@ -17857,7 +18016,7 @@
 
 
 /***/ },
-/* 121 */
+/* 124 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -17872,7 +18031,7 @@
 	 * @typechecks
 	 */
 
-	var isTextNode = __webpack_require__(167);
+	var isTextNode = __webpack_require__(170);
 
 	/*jslint bitwise:true */
 
@@ -17905,7 +18064,7 @@
 
 
 /***/ },
-/* 122 */
+/* 125 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -17944,7 +18103,7 @@
 
 
 /***/ },
-/* 123 */
+/* 126 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -17961,13 +18120,13 @@
 
 	'use strict';
 
-	var ReactCompositeComponent = __webpack_require__(74);
-	var ReactEmptyComponent = __webpack_require__(72);
-	var ReactNativeComponent = __webpack_require__(86);
+	var ReactCompositeComponent = __webpack_require__(77);
+	var ReactEmptyComponent = __webpack_require__(75);
+	var ReactNativeComponent = __webpack_require__(89);
 
-	var assign = __webpack_require__(38);
-	var invariant = __webpack_require__(39);
-	var warning = __webpack_require__(40);
+	var assign = __webpack_require__(41);
+	var invariant = __webpack_require__(42);
+	var warning = __webpack_require__(43);
 
 	// To avoid a cyclic dependency, we create the final class in this module
 	var ReactCompositeComponentWrapper = function() { };
@@ -18082,10 +18241,10 @@
 
 	module.exports = instantiateReactComponent;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 124 */
+/* 127 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -18103,7 +18262,7 @@
 
 	'use strict';
 
-	var ExecutionEnvironment = __webpack_require__(59);
+	var ExecutionEnvironment = __webpack_require__(60);
 
 	var WHITESPACE_TEST = /^[ \r\n\t\f]/;
 	var NONVISIBLE_TEST = /<(!--|link|noscript|meta|script|style)[ \r\n\t\f\/>]/;
@@ -18178,7 +18337,7 @@
 
 
 /***/ },
-/* 125 */
+/* 128 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -18195,7 +18354,7 @@
 
 	'use strict';
 
-	var warning = __webpack_require__(40);
+	var warning = __webpack_require__(43);
 
 	/**
 	 * Given a `prevElement` and `nextElement`, determines if the existing
@@ -18282,10 +18441,10 @@
 
 	module.exports = shouldUpdateReactComponent;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 126 */
+/* 129 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -18302,13 +18461,13 @@
 
 	'use strict';
 
-	var PooledClass = __webpack_require__(33);
-	var CallbackQueue = __webpack_require__(32);
-	var ReactPutListenerQueue = __webpack_require__(156);
-	var Transaction = __webpack_require__(37);
+	var PooledClass = __webpack_require__(36);
+	var CallbackQueue = __webpack_require__(35);
+	var ReactPutListenerQueue = __webpack_require__(159);
+	var Transaction = __webpack_require__(40);
 
-	var assign = __webpack_require__(38);
-	var emptyFunction = __webpack_require__(63);
+	var assign = __webpack_require__(41);
+	var emptyFunction = __webpack_require__(66);
 
 	/**
 	 * Provides a `CallbackQueue` queue for collecting `onDOMReady` callbacks
@@ -18402,7 +18561,7 @@
 
 
 /***/ },
-/* 127 */
+/* 130 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -18433,7 +18592,7 @@
 
 
 /***/ },
-/* 128 */
+/* 131 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -18448,7 +18607,7 @@
 	 * @typechecks
 	 */
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * The CSSCore module specifies the API (and implements most of the methods)
@@ -18545,10 +18704,10 @@
 
 	module.exports = CSSCore;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 129 */
+/* 132 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -18564,7 +18723,7 @@
 
 	'use strict';
 
-	var ExecutionEnvironment = __webpack_require__(59);
+	var ExecutionEnvironment = __webpack_require__(60);
 
 	/**
 	 * EVENT_NAME_MAP is used to determine which event fired when a
@@ -18663,7 +18822,7 @@
 
 
 /***/ },
-/* 130 */
+/* 133 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -18708,7 +18867,7 @@
 
 
 /***/ },
-/* 131 */
+/* 134 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -18725,7 +18884,7 @@
 
 	"use strict";
 
-	var ExecutionEnvironment = __webpack_require__(59);
+	var ExecutionEnvironment = __webpack_require__(60);
 
 	var performance;
 
@@ -18740,7 +18899,7 @@
 
 
 /***/ },
-/* 132 */
+/* 135 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -18757,7 +18916,7 @@
 
 	'use strict';
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Injectable ordering of event plugins.
@@ -19020,10 +19179,10 @@
 
 	module.exports = EventPluginRegistry;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 133 */
+/* 136 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -19039,7 +19198,7 @@
 
 	'use strict';
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 *
@@ -19089,10 +19248,10 @@
 
 	module.exports = accumulateInto;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 134 */
+/* 137 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -19127,7 +19286,7 @@
 
 
 /***/ },
-/* 135 */
+/* 138 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -19143,7 +19302,7 @@
 
 	'use strict';
 
-	var EventPluginHub = __webpack_require__(70);
+	var EventPluginHub = __webpack_require__(73);
 
 	function runEventQueueInBatch(events) {
 	  EventPluginHub.enqueueEvents(events);
@@ -19181,7 +19340,7 @@
 
 
 /***/ },
-/* 136 */
+/* 139 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -19214,7 +19373,7 @@
 
 
 /***/ },
-/* 137 */
+/* 140 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -19230,7 +19389,7 @@
 
 	'use strict';
 
-	var ExecutionEnvironment = __webpack_require__(59);
+	var ExecutionEnvironment = __webpack_require__(60);
 
 	var useHasFeature;
 	if (ExecutionEnvironment.canUseDOM) {
@@ -19283,7 +19442,7 @@
 
 
 /***/ },
-/* 138 */
+/* 141 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -19299,7 +19458,7 @@
 
 	'use strict';
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	var injected = false;
 
@@ -19344,10 +19503,10 @@
 
 	module.exports = ReactComponentEnvironment;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 139 */
+/* 142 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -19382,7 +19541,7 @@
 
 
 /***/ },
-/* 140 */
+/* 143 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -19398,7 +19557,7 @@
 
 	'use strict';
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * ReactOwners are capable of storing references to owned components.
@@ -19494,10 +19653,10 @@
 
 	module.exports = ReactOwner;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 141 */
+/* 144 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -19513,7 +19672,7 @@
 
 	'use strict';
 
-	var escapeTextContentForBrowser = __webpack_require__(92);
+	var escapeTextContentForBrowser = __webpack_require__(95);
 
 	/**
 	 * Escapes attribute value to prevent scripting attacks.
@@ -19529,7 +19688,7 @@
 
 
 /***/ },
-/* 142 */
+/* 145 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -19546,14 +19705,14 @@
 
 	'use strict';
 
-	var CSSProperty = __webpack_require__(168);
-	var ExecutionEnvironment = __webpack_require__(59);
+	var CSSProperty = __webpack_require__(171);
+	var ExecutionEnvironment = __webpack_require__(60);
 
-	var camelizeStyleName = __webpack_require__(169);
-	var dangerousStyleValue = __webpack_require__(170);
-	var hyphenateStyleName = __webpack_require__(171);
-	var memoizeStringOnly = __webpack_require__(172);
-	var warning = __webpack_require__(40);
+	var camelizeStyleName = __webpack_require__(172);
+	var dangerousStyleValue = __webpack_require__(173);
+	var hyphenateStyleName = __webpack_require__(174);
+	var memoizeStringOnly = __webpack_require__(175);
+	var warning = __webpack_require__(43);
 
 	var processStyleName = memoizeStringOnly(function(styleName) {
 	  return hyphenateStyleName(styleName);
@@ -19711,10 +19870,10 @@
 
 	module.exports = CSSPropertyOperations;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 143 */
+/* 146 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -19731,11 +19890,11 @@
 
 	'use strict';
 
-	var ReactComponentEnvironment = __webpack_require__(138);
-	var ReactMultiChildUpdateTypes = __webpack_require__(173);
+	var ReactComponentEnvironment = __webpack_require__(141);
+	var ReactMultiChildUpdateTypes = __webpack_require__(176);
 
-	var ReactReconciler = __webpack_require__(36);
-	var ReactChildReconciler = __webpack_require__(174);
+	var ReactReconciler = __webpack_require__(39);
+	var ReactChildReconciler = __webpack_require__(177);
 
 	/**
 	 * Updating children of a component may trigger recursive updates. The depth is
@@ -20148,7 +20307,7 @@
 
 
 /***/ },
-/* 144 */
+/* 147 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -20165,10 +20324,10 @@
 
 	'use strict';
 
-	var PooledClass = __webpack_require__(33);
+	var PooledClass = __webpack_require__(36);
 
-	var assign = __webpack_require__(38);
-	var getTextContentAccessor = __webpack_require__(175);
+	var assign = __webpack_require__(41);
+	var getTextContentAccessor = __webpack_require__(178);
 
 	/**
 	 * This helper class stores information about text content of a target node,
@@ -20243,7 +20402,7 @@
 
 
 /***/ },
-/* 145 */
+/* 148 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -20260,7 +20419,7 @@
 
 	'use strict';
 
-	var SyntheticEvent = __webpack_require__(76);
+	var SyntheticEvent = __webpack_require__(79);
 
 	/**
 	 * @interface Event
@@ -20292,7 +20451,7 @@
 
 
 /***/ },
-/* 146 */
+/* 149 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -20309,7 +20468,7 @@
 
 	'use strict';
 
-	var SyntheticEvent = __webpack_require__(76);
+	var SyntheticEvent = __webpack_require__(79);
 
 	/**
 	 * @interface Event
@@ -20342,7 +20501,7 @@
 
 
 /***/ },
-/* 147 */
+/* 150 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -20389,7 +20548,7 @@
 
 
 /***/ },
-/* 148 */
+/* 151 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -20406,10 +20565,10 @@
 
 	'use strict';
 
-	var SyntheticUIEvent = __webpack_require__(163);
-	var ViewportMetrics = __webpack_require__(136);
+	var SyntheticUIEvent = __webpack_require__(166);
+	var ViewportMetrics = __webpack_require__(139);
 
-	var getEventModifierState = __webpack_require__(176);
+	var getEventModifierState = __webpack_require__(179);
 
 	/**
 	 * @interface MouseEvent
@@ -20474,7 +20633,7 @@
 
 
 /***/ },
-/* 149 */
+/* 152 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -20491,7 +20650,7 @@
 
 	'use strict';
 
-	var focusNode = __webpack_require__(177);
+	var focusNode = __webpack_require__(180);
 
 	var AutoFocusMixin = {
 	  componentDidMount: function() {
@@ -20505,7 +20664,7 @@
 
 
 /***/ },
-/* 150 */
+/* 153 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -20521,11 +20680,11 @@
 
 	'use strict';
 
-	var ReactBrowserEventEmitter = __webpack_require__(73);
+	var ReactBrowserEventEmitter = __webpack_require__(76);
 
-	var accumulateInto = __webpack_require__(133);
-	var forEachAccumulated = __webpack_require__(134);
-	var invariant = __webpack_require__(39);
+	var accumulateInto = __webpack_require__(136);
+	var forEachAccumulated = __webpack_require__(137);
+	var invariant = __webpack_require__(42);
 
 	function remove(event) {
 	  event.remove();
@@ -20562,10 +20721,10 @@
 
 	module.exports = LocalEventTrapMixin;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 151 */
+/* 154 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -20582,11 +20741,11 @@
 
 	'use strict';
 
-	var Danger = __webpack_require__(178);
-	var ReactMultiChildUpdateTypes = __webpack_require__(173);
+	var Danger = __webpack_require__(181);
+	var ReactMultiChildUpdateTypes = __webpack_require__(176);
 
-	var setTextContent = __webpack_require__(179);
-	var invariant = __webpack_require__(39);
+	var setTextContent = __webpack_require__(182);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Inserts `childNode` as a child of `parentNode` at the `index`.
@@ -20703,10 +20862,10 @@
 
 	module.exports = DOMChildrenOperations;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 152 */
+/* 155 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -20723,9 +20882,9 @@
 
 	'use strict';
 
-	var ReactPropTypes = __webpack_require__(55);
+	var ReactPropTypes = __webpack_require__(56);
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	var hasReadOnlyValue = {
 	  'button': true,
@@ -20862,10 +21021,10 @@
 
 	module.exports = LinkedValueUtils;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 153 */
+/* 156 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -20887,7 +21046,7 @@
 	 * @typechecks
 	 */
 
-	var emptyFunction = __webpack_require__(63);
+	var emptyFunction = __webpack_require__(66);
 
 	/**
 	 * Upstream version of event listener. Does not take into account specific
@@ -20955,10 +21114,10 @@
 
 	module.exports = EventListener;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 154 */
+/* 157 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21002,7 +21161,7 @@
 
 
 /***/ },
-/* 155 */
+/* 158 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21018,11 +21177,11 @@
 
 	'use strict';
 
-	var ReactDOMSelection = __webpack_require__(180);
+	var ReactDOMSelection = __webpack_require__(183);
 
-	var containsNode = __webpack_require__(121);
-	var focusNode = __webpack_require__(177);
-	var getActiveElement = __webpack_require__(157);
+	var containsNode = __webpack_require__(124);
+	var focusNode = __webpack_require__(180);
+	var getActiveElement = __webpack_require__(160);
 
 	function isInDocument(node) {
 	  return containsNode(document.documentElement, node);
@@ -21141,7 +21300,7 @@
 
 
 /***/ },
-/* 156 */
+/* 159 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21157,10 +21316,10 @@
 
 	'use strict';
 
-	var PooledClass = __webpack_require__(33);
-	var ReactBrowserEventEmitter = __webpack_require__(73);
+	var PooledClass = __webpack_require__(36);
+	var ReactBrowserEventEmitter = __webpack_require__(76);
 
-	var assign = __webpack_require__(38);
+	var assign = __webpack_require__(41);
 
 	function ReactPutListenerQueue() {
 	  this.listenersToPut = [];
@@ -21201,7 +21360,7 @@
 
 
 /***/ },
-/* 157 */
+/* 160 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21234,7 +21393,7 @@
 
 
 /***/ },
-/* 158 */
+/* 161 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21251,7 +21410,7 @@
 
 	'use strict';
 
-	var SyntheticMouseEvent = __webpack_require__(148);
+	var SyntheticMouseEvent = __webpack_require__(151);
 
 	/**
 	 * @interface DragEvent
@@ -21277,7 +21436,7 @@
 
 
 /***/ },
-/* 159 */
+/* 162 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21294,7 +21453,7 @@
 
 	'use strict';
 
-	var SyntheticEvent = __webpack_require__(76);
+	var SyntheticEvent = __webpack_require__(79);
 
 	/**
 	 * @interface Event
@@ -21326,7 +21485,7 @@
 
 
 /***/ },
-/* 160 */
+/* 163 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21343,7 +21502,7 @@
 
 	'use strict';
 
-	var SyntheticUIEvent = __webpack_require__(163);
+	var SyntheticUIEvent = __webpack_require__(166);
 
 	/**
 	 * @interface FocusEvent
@@ -21369,7 +21528,7 @@
 
 
 /***/ },
-/* 161 */
+/* 164 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21386,11 +21545,11 @@
 
 	'use strict';
 
-	var SyntheticUIEvent = __webpack_require__(163);
+	var SyntheticUIEvent = __webpack_require__(166);
 
-	var getEventCharCode = __webpack_require__(165);
-	var getEventKey = __webpack_require__(181);
-	var getEventModifierState = __webpack_require__(176);
+	var getEventCharCode = __webpack_require__(168);
+	var getEventKey = __webpack_require__(184);
+	var getEventModifierState = __webpack_require__(179);
 
 	/**
 	 * @interface KeyboardEvent
@@ -21460,7 +21619,7 @@
 
 
 /***/ },
-/* 162 */
+/* 165 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21477,9 +21636,9 @@
 
 	'use strict';
 
-	var SyntheticUIEvent = __webpack_require__(163);
+	var SyntheticUIEvent = __webpack_require__(166);
 
-	var getEventModifierState = __webpack_require__(176);
+	var getEventModifierState = __webpack_require__(179);
 
 	/**
 	 * @interface TouchEvent
@@ -21512,7 +21671,7 @@
 
 
 /***/ },
-/* 163 */
+/* 166 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21529,9 +21688,9 @@
 
 	'use strict';
 
-	var SyntheticEvent = __webpack_require__(76);
+	var SyntheticEvent = __webpack_require__(79);
 
-	var getEventTarget = __webpack_require__(139);
+	var getEventTarget = __webpack_require__(142);
 
 	/**
 	 * @interface UIEvent
@@ -21578,7 +21737,7 @@
 
 
 /***/ },
-/* 164 */
+/* 167 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21595,7 +21754,7 @@
 
 	'use strict';
 
-	var SyntheticMouseEvent = __webpack_require__(148);
+	var SyntheticMouseEvent = __webpack_require__(151);
 
 	/**
 	 * @interface WheelEvent
@@ -21643,7 +21802,7 @@
 
 
 /***/ },
-/* 165 */
+/* 168 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21699,7 +21858,7 @@
 
 
 /***/ },
-/* 166 */
+/* 169 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21737,7 +21896,7 @@
 
 
 /***/ },
-/* 167 */
+/* 170 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21752,7 +21911,7 @@
 	 * @typechecks
 	 */
 
-	var isNode = __webpack_require__(127);
+	var isNode = __webpack_require__(130);
 
 	/**
 	 * @param {*} object The object to check.
@@ -21766,7 +21925,7 @@
 
 
 /***/ },
-/* 168 */
+/* 171 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21895,7 +22054,7 @@
 
 
 /***/ },
-/* 169 */
+/* 172 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21912,7 +22071,7 @@
 
 	"use strict";
 
-	var camelize = __webpack_require__(182);
+	var camelize = __webpack_require__(185);
 
 	var msPattern = /^-ms-/;
 
@@ -21941,7 +22100,7 @@
 
 
 /***/ },
-/* 170 */
+/* 173 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -21958,7 +22117,7 @@
 
 	'use strict';
 
-	var CSSProperty = __webpack_require__(168);
+	var CSSProperty = __webpack_require__(171);
 
 	var isUnitlessNumber = CSSProperty.isUnitlessNumber;
 
@@ -22003,7 +22162,7 @@
 
 
 /***/ },
-/* 171 */
+/* 174 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22020,7 +22179,7 @@
 
 	"use strict";
 
-	var hyphenate = __webpack_require__(183);
+	var hyphenate = __webpack_require__(186);
 
 	var msPattern = /^ms-/;
 
@@ -22048,7 +22207,7 @@
 
 
 /***/ },
-/* 172 */
+/* 175 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22085,7 +22244,7 @@
 
 
 /***/ },
-/* 173 */
+/* 176 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22101,7 +22260,7 @@
 
 	'use strict';
 
-	var keyMirror = __webpack_require__(85);
+	var keyMirror = __webpack_require__(88);
 
 	/**
 	 * When a component's children are updated, a series of update configuration
@@ -22122,7 +22281,7 @@
 
 
 /***/ },
-/* 174 */
+/* 177 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22139,11 +22298,11 @@
 
 	'use strict';
 
-	var ReactReconciler = __webpack_require__(36);
+	var ReactReconciler = __webpack_require__(39);
 
-	var flattenChildren = __webpack_require__(184);
-	var instantiateReactComponent = __webpack_require__(123);
-	var shouldUpdateReactComponent = __webpack_require__(125);
+	var flattenChildren = __webpack_require__(187);
+	var instantiateReactComponent = __webpack_require__(126);
+	var shouldUpdateReactComponent = __webpack_require__(128);
 
 	/**
 	 * ReactChildReconciler provides helpers for initializing or updating a set of
@@ -22253,7 +22412,7 @@
 
 
 /***/ },
-/* 175 */
+/* 178 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22269,7 +22428,7 @@
 
 	'use strict';
 
-	var ExecutionEnvironment = __webpack_require__(59);
+	var ExecutionEnvironment = __webpack_require__(60);
 
 	var contentKey = null;
 
@@ -22294,7 +22453,7 @@
 
 
 /***/ },
-/* 176 */
+/* 179 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22345,7 +22504,7 @@
 
 
 /***/ },
-/* 177 */
+/* 180 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22378,7 +22537,7 @@
 
 
 /***/ },
-/* 178 */
+/* 181 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -22397,12 +22556,12 @@
 
 	'use strict';
 
-	var ExecutionEnvironment = __webpack_require__(59);
+	var ExecutionEnvironment = __webpack_require__(60);
 
-	var createNodesFromMarkup = __webpack_require__(185);
-	var emptyFunction = __webpack_require__(63);
-	var getMarkupWrap = __webpack_require__(186);
-	var invariant = __webpack_require__(39);
+	var createNodesFromMarkup = __webpack_require__(188);
+	var emptyFunction = __webpack_require__(66);
+	var getMarkupWrap = __webpack_require__(189);
+	var invariant = __webpack_require__(42);
 
 	var OPEN_TAG_NAME_EXP = /^(<[^ \/>]+)/;
 	var RESULT_INDEX_ATTR = 'data-danger-index';
@@ -22565,10 +22724,10 @@
 
 	module.exports = Danger;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 179 */
+/* 182 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22584,9 +22743,9 @@
 
 	'use strict';
 
-	var ExecutionEnvironment = __webpack_require__(59);
-	var escapeTextContentForBrowser = __webpack_require__(92);
-	var setInnerHTML = __webpack_require__(124);
+	var ExecutionEnvironment = __webpack_require__(60);
+	var escapeTextContentForBrowser = __webpack_require__(95);
+	var setInnerHTML = __webpack_require__(127);
 
 	/**
 	 * Set the textContent property of a node, ensuring that whitespace is preserved
@@ -22614,7 +22773,7 @@
 
 
 /***/ },
-/* 180 */
+/* 183 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22630,10 +22789,10 @@
 
 	'use strict';
 
-	var ExecutionEnvironment = __webpack_require__(59);
+	var ExecutionEnvironment = __webpack_require__(60);
 
-	var getNodeForCharacterOffset = __webpack_require__(187);
-	var getTextContentAccessor = __webpack_require__(175);
+	var getNodeForCharacterOffset = __webpack_require__(190);
+	var getTextContentAccessor = __webpack_require__(178);
 
 	/**
 	 * While `isCollapsed` is available on the Selection object and `collapsed`
@@ -22831,7 +22990,7 @@
 
 
 /***/ },
-/* 181 */
+/* 184 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22848,7 +23007,7 @@
 
 	'use strict';
 
-	var getEventCharCode = __webpack_require__(165);
+	var getEventCharCode = __webpack_require__(168);
 
 	/**
 	 * Normalization of deprecated HTML5 `key` values
@@ -22940,7 +23099,7 @@
 
 
 /***/ },
-/* 182 */
+/* 185 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -22976,7 +23135,7 @@
 
 
 /***/ },
-/* 183 */
+/* 186 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -23013,7 +23172,7 @@
 
 
 /***/ },
-/* 184 */
+/* 187 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -23029,8 +23188,8 @@
 
 	'use strict';
 
-	var traverseAllChildren = __webpack_require__(79);
-	var warning = __webpack_require__(40);
+	var traverseAllChildren = __webpack_require__(82);
+	var warning = __webpack_require__(43);
 
 	/**
 	 * @param {function} traverseContext Context passed through traversal.
@@ -23071,10 +23230,10 @@
 
 	module.exports = flattenChildren;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 185 */
+/* 188 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -23091,11 +23250,11 @@
 
 	/*jslint evil: true, sub: true */
 
-	var ExecutionEnvironment = __webpack_require__(59);
+	var ExecutionEnvironment = __webpack_require__(60);
 
-	var createArrayFromMixed = __webpack_require__(188);
-	var getMarkupWrap = __webpack_require__(186);
-	var invariant = __webpack_require__(39);
+	var createArrayFromMixed = __webpack_require__(191);
+	var getMarkupWrap = __webpack_require__(189);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Dummy container used to render all markup.
@@ -23164,10 +23323,10 @@
 
 	module.exports = createNodesFromMarkup;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 186 */
+/* 189 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -23181,9 +23340,9 @@
 	 * @providesModule getMarkupWrap
 	 */
 
-	var ExecutionEnvironment = __webpack_require__(59);
+	var ExecutionEnvironment = __webpack_require__(60);
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Dummy container used to detect which wraps are necessary.
@@ -23286,10 +23445,10 @@
 
 	module.exports = getMarkupWrap;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ },
-/* 187 */
+/* 190 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -23368,7 +23527,7 @@
 
 
 /***/ },
-/* 188 */
+/* 191 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/**
@@ -23383,7 +23542,7 @@
 	 * @typechecks
 	 */
 
-	var toArray = __webpack_require__(189);
+	var toArray = __webpack_require__(192);
 
 	/**
 	 * Perform a heuristic test to determine if an object is "array-like".
@@ -23458,7 +23617,7 @@
 
 
 /***/ },
-/* 189 */
+/* 192 */
 /***/ function(module, exports, __webpack_require__) {
 
 	/* WEBPACK VAR INJECTION */(function(process) {/**
@@ -23473,7 +23632,7 @@
 	 * @typechecks
 	 */
 
-	var invariant = __webpack_require__(39);
+	var invariant = __webpack_require__(42);
 
 	/**
 	 * Convert array-like objects to arrays.
@@ -23530,7 +23689,7 @@
 
 	module.exports = toArray;
 
-	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(31)))
+	/* WEBPACK VAR INJECTION */}.call(exports, __webpack_require__(34)))
 
 /***/ }
 /******/ ]);
