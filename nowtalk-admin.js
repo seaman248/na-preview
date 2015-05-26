@@ -804,14 +804,8 @@
 	                React.createElement("ul", {className: "nowtalk-admin__channellist-item-submenu subsub"}, 
 	                  React.createElement("li", null, 
 	                    React.createElement("div", {className: "submenu-item-container"}, 
-	                      React.createElement("i", {className: "fa fa-trash"}), 
-	                      React.createElement("span", null, "Delete/Disable Chat")
-	                    )
-	                  ), 
-	                  React.createElement("li", null, 
-	                    React.createElement("div", {className: "submenu-item-container"}, 
 	                      React.createElement("i", {className: "fa fa-info"}), 
-	                      React.createElement("span", null, "Chat info")
+	                      React.createElement("span", null, "Chat Info")
 	                    )
 	                  ), 
 	                   React.createElement("li", null, 
@@ -823,13 +817,19 @@
 	                   React.createElement("li", null, 
 	                    React.createElement("div", {className: "submenu-item-container"}, 
 	                      React.createElement("i", {className: "fa fa-lock"}), 
-	                      React.createElement("span", null, "Privacy Settings")
+	                      React.createElement("span", null, "Privacy")
 	                    )
 	                  ), 
 	                   React.createElement("li", null, 
 	                    React.createElement("div", {className: "submenu-item-container"}, 
 	                      React.createElement("i", {className: "fa fa-user"}), 
-	                      React.createElement("span", null, "User Role")
+	                      React.createElement("span", null, "User Roles")
+	                    )
+	                  ), 
+	                  React.createElement("li", null, 
+	                    React.createElement("div", {className: "submenu-item-container"}, 
+	                      React.createElement("i", {className: "fa fa-trash"}), 
+	                      React.createElement("span", null, "Delete Chat")
 	                    )
 	                  )
 	                )
