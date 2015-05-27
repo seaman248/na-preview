@@ -1381,8 +1381,7 @@
 	                  ), 
 	                  React.createElement("div", {className: "remove-role"}, 
 	                    React.createElement("div", {className: "remove-role-container"}, 
-	                      React.createElement("i", {className: "fa fa-minus-circle"}), 
-	                      React.createElement("span", null, "Remove Admin")
+	                      React.createElement("i", {className: "fa fa-close"})
 	                    )
 	                  )
 	                ), 
@@ -1401,8 +1400,7 @@
 	                  ), 
 	                  React.createElement("div", {className: "remove-role"}, 
 	                    React.createElement("div", {className: "remove-role-container"}, 
-	                      React.createElement("i", {className: "fa fa-minus-circle"}), 
-	                      React.createElement("span", null, "Remove Admin")
+	                      React.createElement("i", {className: "fa fa-close"})
 	                    )
 	                  )
 	                ), 
@@ -1421,8 +1419,7 @@
 	                  ), 
 	                  React.createElement("div", {className: "remove-role"}, 
 	                    React.createElement("div", {className: "remove-role-container"}, 
-	                      React.createElement("i", {className: "fa fa-minus-circle"}), 
-	                      React.createElement("span", null, "Remove Admin")
+	                      React.createElement("i", {className: "fa fa-close"})
 	                    )
 	                  )
 	                ), 
@@ -1441,8 +1438,7 @@
 	                  ), 
 	                  React.createElement("div", {className: "remove-role"}, 
 	                    React.createElement("div", {className: "remove-role-container"}, 
-	                      React.createElement("i", {className: "fa fa-minus-circle"}), 
-	                      React.createElement("span", null, "Remove Admin")
+	                      React.createElement("i", {className: "fa fa-close"})
 	                    )
 	                  )
 	                ), 
@@ -1461,8 +1457,7 @@
 	                  ), 
 	                  React.createElement("div", {className: "remove-role"}, 
 	                    React.createElement("div", {className: "remove-role-container"}, 
-	                      React.createElement("i", {className: "fa fa-minus-circle"}), 
-	                      React.createElement("span", null, "Remove Admin")
+	                      React.createElement("i", {className: "fa fa-close"})
 	                    )
 	                  )
 	                ), 
@@ -1481,8 +1476,7 @@
 	                  ), 
 	                  React.createElement("div", {className: "remove-role"}, 
 	                    React.createElement("div", {className: "remove-role-container"}, 
-	                      React.createElement("i", {className: "fa fa-minus-circle"}), 
-	                      React.createElement("span", null, "Remove Admin")
+	                      React.createElement("i", {className: "fa fa-close"})
 	                    )
 	                  )
 	                )
