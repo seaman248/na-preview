@@ -1317,9 +1317,9 @@
 	                  ), 
 	                  React.createElement("div", {className: "input-container"}, 
 	                    React.createElement("div", {className: "input-placeholder"}, "Vertically"), 
-	                    React.createElement("input", {type: "text", className: "input-half"}), 
+	                    React.createElement("input", {type: "text", value: "0 px", className: "input-half"}), 
 	                    React.createElement("div", {className: "input-placeholder"}, "Horizontally"), 
-	                    React.createElement("input", {type: "text", className: "input-half"})
+	                    React.createElement("input", {type: "text", value: "10 px", className: "input-half"})
 	                  ), 
 	                  React.createElement("div", {className: "nowtalk-admin__help"}, 
 	                    React.createElement("i", {className: "fa fa-question"})
